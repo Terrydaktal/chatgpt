@@ -24,7 +24,7 @@ function createWindow() {
 
   if (isDev) {
     mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools();
+    // mainWindow.webContents.openDevTools();
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
@@ -64,25 +64,31 @@ function setupIpc() {
 
   const lastSync = new Map();
 
-  ipcMain.handle('api:syncConversations', async () => {
+  ipcMain.handle('api:syncConversations', async (event, { offset = 0, limit = 20 } = {}) => {
     try {
-      const response = await auth.fetchWithAuth('https://chatgpt.com/backend-api/conversations?offset=0&limit=20&order=updated');
+      const response = await auth.fetchWithAuth(`https://chatgpt.com/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`);
       const data = await response.json();
       
       if (data.items) {
         db.db.transaction(() => {
           data.items.forEach(item => {
+            // Get existing to preserve current_node_id if we have it
+            const existing = db.getConversation(item.id);
             db.upsertConversation({
               id: item.id,
               title: item.title,
               created_at: item.create_time,
               updated_at: item.update_time,
-              current_node_id: null // List API doesn't provide current_node_id
+              current_node_id: existing ? existing.current_node_id : null
             });
           });
         })();
       }
-      return db.getConversations();
+      return { 
+        conversations: db.getConversations(),
+        total: data.total,
+        hasMore: (offset + limit) < data.total
+      };
     } catch (error) {
       console.error('Sync failed:', error);
       throw error;

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, memo } from 'react';
+import { useState, useEffect, useRef, memo, useCallback } from 'react';
 import type { Conversation, Message } from './types';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -19,6 +19,8 @@ const MarkdownMessage = memo(({ content }: { content: string }) => {
               style={vscDarkPlus as any}
               language={match[1]}
               PreTag="div"
+              codeTagProps={{ style: { fontSize: 'inherit' } }}
+              customStyle={{ margin: 0, padding: 0, background: 'transparent', fontSize: 'inherit' }}
               {...props}
             >
               {String(children).replace(/\n$/, '')}
@@ -49,6 +51,17 @@ const MessageRow = memo(({ msg }: { msg: Message }) => {
   );
 });
 
+const ConversationItem = memo(({ conv, active, onClick }: { conv: Conversation, active: boolean, onClick: () => void }) => {
+  return (
+    <div 
+      className={`conversation-item ${active ? 'active' : ''}`}
+      onClick={onClick}
+    >
+      {conv.title || 'New Chat'}
+    </div>
+  );
+});
+
 function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConvId, setActiveConvId] = useState<string | null>(localStorage.getItem('lastConvId'));
@@ -59,6 +72,19 @@ function App() {
   const [thinkingMode, setThinkingMode] = useState<'standard' | 'extended'>((localStorage.getItem('thinkingMode') as any) || 'standard');
   const [pastedImage, setPastedImage] = useState<string | null>(null);
   const [inputValue, setInputValue] = useState('');
+
+  const [fontSize, setFontSize] = useState<number>(Number(localStorage.getItem('fontSize')) || 12);
+  const [chatWidth, setChatWidth] = useState<number>(Number(localStorage.getItem('chatWidth')) || 800);
+  const [showSettings, setShowSettings] = useState(false);
+
+  const [hasMoreConvs, setHasMoreConvs] = useState(true);
+  const [isLoadingMoreConvs, setIsLoadingMoreConvs] = useState(false);
+
+  const [isPanning, setIsPanning] = useState(false);
+  const panStart = useRef({ x: 0, y: 0 });
+  const panCurrent = useRef({ x: 0, y: 0 });
+  const panRaf = useRef<number | null>(null);
+  const scrollerRef = useRef<HTMLElement | null>(null);
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const activeConvIdRef = useRef<string | null>(localStorage.getItem('lastConvId'));
@@ -72,6 +98,16 @@ function App() {
   }, [thinkingMode]);
 
   useEffect(() => {
+    localStorage.setItem('fontSize', fontSize.toString());
+    document.documentElement.style.setProperty('--app-font-size', `${fontSize}pt`);
+  }, [fontSize]);
+
+  useEffect(() => {
+    localStorage.setItem('chatWidth', chatWidth.toString());
+    document.documentElement.style.setProperty('--message-max-width', `${chatWidth}px`);
+  }, [chatWidth]);
+
+  useEffect(() => {
     if (activeConvId) {
       localStorage.setItem('lastConvId', activeConvId);
       activeConvIdRef.current = activeConvId;
@@ -80,6 +116,43 @@ function App() {
       activeConvIdRef.current = null;
     }
   }, [activeConvId]);
+
+  useEffect(() => {
+    if (!isPanning) {
+      if (panRaf.current) cancelAnimationFrame(panRaf.current);
+      return;
+    }
+
+    const handleMouseMove = (e: MouseEvent) => {
+      panCurrent.current = { x: e.clientX, y: e.clientY };
+    };
+
+    const handleMouseUp = (e: MouseEvent) => {
+      if (e.button === 1) setIsPanning(false);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove, { passive: true });
+    window.addEventListener('mouseup', handleMouseUp, { passive: true });
+
+    const scrollLoop = () => {
+      if (scrollerRef.current) {
+        const dy = panCurrent.current.y - panStart.current.y;
+        if (Math.abs(dy) > 5) {
+          const speed = (dy - Math.sign(dy) * 5) * 0.15;
+          scrollerRef.current.scrollBy(0, speed);
+        }
+      }
+      panRaf.current = requestAnimationFrame(scrollLoop);
+    };
+
+    panRaf.current = requestAnimationFrame(scrollLoop);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      if (panRaf.current) cancelAnimationFrame(panRaf.current);
+    };
+  }, [isPanning]);
 
   useEffect(() => {
     checkAuth().then(() => {
@@ -122,7 +195,6 @@ function App() {
       created_at: Date.now() / 1000,
     };
 
-    // Optimistically add to UI
     setMessages(prev => [...prev, userMsg]);
     setInputValue('');
     const currentImage = pastedImage;
@@ -165,16 +237,38 @@ function App() {
   };
 
   const loadConversations = async () => {
+    // 1. Load from DB first
     const localConvs = await window.electronAPI.invoke('db:getConversations');
     setConversations(localConvs);
     
+    // 2. Sync first page from API
     try {
-      const syncedConvs = await window.electronAPI.invoke('api:syncConversations');
-      setConversations(syncedConvs);
-    } catch (error) {
-      console.error('Failed to sync conversations', error);
+      const result = await window.electronAPI.invoke('api:syncConversations', { offset: 0, limit: 20 });
+      setConversations(result.conversations);
+      setHasMoreConvs(result.hasMore);
+    } catch (e) {
+      console.error('Failed to sync conversations', e);
     }
   };
+
+  const loadMoreConversations = useCallback(async () => {
+    if (isLoadingMoreConvs || !hasMoreConvs) return;
+
+    setIsLoadingMoreConvs(true);
+    try {
+      // Offset is current synced count from API perspective, but we can just use length
+      const result = await window.electronAPI.invoke('api:syncConversations', { 
+        offset: conversations.length, 
+        limit: 20 
+      });
+      setConversations(result.conversations);
+      setHasMoreConvs(result.hasMore);
+    } catch (e) {
+      console.error('Failed to load more conversations', e);
+    } finally {
+      setIsLoadingMoreConvs(false);
+    }
+  }, [conversations.length, hasMoreConvs, isLoadingMoreConvs]);
 
   const selectConversation = async (id: string, forceSync = false) => {
     if (id === activeConvId && !forceSync) return;
@@ -182,11 +276,9 @@ function App() {
     setActiveConvId(id);
     activeConvIdRef.current = id;
     
-    // 1. Load from local cache instantly
     const localMsgs = await window.electronAPI.invoke('db:getMessages', id);
     setMessages(localMsgs);
 
-    // 2. Sync from API in background
     setIsSyncing(true);
     window.electronAPI.invoke('api:syncMessages', id)
       .then((syncedMsgs: Message[]) => {
@@ -201,6 +293,15 @@ function App() {
       .finally(() => {
         if (activeConvIdRef.current === id) setIsSyncing(false);
       });
+  };
+
+  const startPanning = (e: React.MouseEvent) => {
+    if (e.button === 1) {
+      e.preventDefault();
+      setIsPanning(true);
+      panStart.current = { x: e.clientX, y: e.clientY };
+      panCurrent.current = { x: e.clientX, y: e.clientY };
+    }
   };
 
   if (isAuth === null) {
@@ -219,6 +320,11 @@ function App() {
 
   return (
     <div className="app-container">
+      {isPanning && (
+        <div className="pan-overlay">
+          <div className="pan-center" style={{ left: panStart.current.x, top: panStart.current.y }} />
+        </div>
+      )}
       <div className="sidebar">
         <div className="sidebar-header">
           <button className="new-chat-btn" onClick={() => {
@@ -228,15 +334,31 @@ function App() {
           }}>+ New Chat</button>
         </div>
         <div className="conversations-list">
-          {conversations.map(conv => (
-            <div 
-              key={conv.id} 
-              className={`conversation-item ${activeConvId === conv.id ? 'active' : ''}`}
-              onClick={() => selectConversation(conv.id)}
-            >
-              {conv.title || 'New Chat'}
-            </div>
-          ))}
+          <Virtuoso
+            data={conversations}
+            endReached={loadMoreConversations}
+            itemContent={(_index, conv) => (
+              <ConversationItem 
+                key={conv.id}
+                conv={conv}
+                active={activeConvId === conv.id}
+                onClick={() => selectConversation(conv.id)}
+              />
+            )}
+            components={{
+              Footer: () => isLoadingMoreConvs ? (
+                <div style={{ padding: '10px', textAlign: 'center', fontSize: '12px', color: '#c5c5d2' }}>Loading more...</div>
+              ) : null
+            }}
+          />
+        </div>
+        <div className="sidebar-footer">
+          <button className="settings-btn" onClick={() => setShowSettings(true)}>
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+              <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+            </svg>
+            Settings
+          </button>
         </div>
       </div>
       
@@ -270,9 +392,10 @@ function App() {
         </div>
 
         {isSyncing && <div className="sync-indicator">Syncing...</div>}
-        <div className="messages-container">
+        <div className="messages-container" onMouseDown={startPanning}>
           <Virtuoso
             ref={virtuosoRef}
+            scrollerRef={(el) => scrollerRef.current = el as HTMLElement}
             data={messages}
             initialTopMostItemIndex={messages.length > 0 ? messages.length - 1 : 0}
             followOutput="auto"
@@ -311,6 +434,42 @@ function App() {
           </div>
         </div>
       </div>
+
+      {showSettings && (
+        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+          <div className="settings-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Settings</h2>
+              <button className="close-modal" onClick={() => setShowSettings(false)}>×</button>
+            </div>
+            <div className="setting-item">
+              <label>
+                Font Size <span className="setting-value">{fontSize}pt</span>
+              </label>
+              <input 
+                type="range" 
+                min="8" 
+                max="20" 
+                value={fontSize} 
+                onChange={(e) => setFontSize(parseInt(e.target.value))} 
+              />
+            </div>
+            <div className="setting-item">
+              <label>
+                Chat Column Width <span className="setting-value">{chatWidth}px</span>
+              </label>
+              <input 
+                type="range" 
+                min="400" 
+                max="5000" 
+                step="50"
+                value={chatWidth} 
+                onChange={(e) => setChatWidth(parseInt(e.target.value))} 
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
