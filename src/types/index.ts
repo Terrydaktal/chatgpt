@@ -9,8 +9,9 @@ export interface Conversation {
 export interface Message {
   id: string;
   conversation_id: string;
-  role: 'user' | 'assistant' | 'system';
+  role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
+  metadata_json?: string | null;
   created_at: number;
   parent_id?: string;
 }

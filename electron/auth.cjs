@@ -7,6 +7,59 @@ class ChatGPTAuth {
     this.accessToken = null;
   }
 
+  getBrowserUserAgent() {
+    const raw = session.defaultSession.getUserAgent();
+    return raw.replace(/\sElectron\/[^\s]+/i, '').trim();
+  }
+
+  getBaseHeaders() {
+    return {
+      'User-Agent': this.getBrowserUserAgent(),
+      'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+      Origin: 'https://chatgpt.com',
+      Referer: 'https://chatgpt.com/',
+      Accept: 'application/json, text/plain, */*',
+    };
+  }
+
+  async clearAuthState({ hardReset = false } = {}) {
+    this.accessToken = null;
+    if (this.authWindow) {
+      this.authWindow.close();
+      this.authWindow = null;
+    }
+    if (!hardReset) return;
+
+    const ses = session.defaultSession;
+    const origins = ['https://chatgpt.com', 'https://chat.openai.com', 'https://auth.openai.com'];
+    const storages = ['cookies', 'localstorage', 'indexdb', 'serviceworkers', 'cachestorage'];
+
+    for (const origin of origins) {
+      try {
+        await ses.clearStorageData({ origin, storages });
+      } catch (error) {
+        console.warn(`Failed to clear storage for ${origin}:`, error);
+      }
+    }
+
+    try {
+      const cookies = await ses.cookies.get({});
+      for (const cookie of cookies) {
+        const domain = String(cookie.domain || '').replace(/^\./, '');
+        if (!domain.endsWith('chatgpt.com') && !domain.endsWith('openai.com')) continue;
+        const proto = cookie.secure ? 'https' : 'http';
+        const url = `${proto}://${domain}${cookie.path || '/'}`;
+        try {
+          await ses.cookies.remove(url, cookie.name);
+        } catch (error) {
+          console.warn(`Failed to remove cookie ${cookie.name} for ${domain}:`, error);
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to enumerate cookies for hard reset:', error);
+    }
+  }
+
   async login() {
     if (this.authWindow) return;
 
@@ -21,6 +74,7 @@ class ChatGPTAuth {
         },
       });
 
+      this.authWindow.webContents.setUserAgent(this.getBrowserUserAgent());
       // Handle popups (Google/Apple login often use them)
       this.authWindow.webContents.setWindowOpenHandler(({ url }) => {
         return { action: 'allow' };
@@ -59,6 +113,11 @@ class ChatGPTAuth {
     });
   }
 
+  async reauthenticate(options = {}) {
+    await this.clearAuthState(options);
+    return this.login();
+  }
+
   async getAccessToken() {
     if (!this.accessToken) {
       try {
@@ -79,8 +138,9 @@ class ChatGPTAuth {
     if (!token) throw new Error('Not authenticated');
 
     const headers = {
-      'Authorization': `Bearer ${token}`,
+      ...this.getBaseHeaders(),
       ...options.headers,
+      'Authorization': `Bearer ${token}`,
     };
 
     const hasContentType = Object.keys(headers).some(

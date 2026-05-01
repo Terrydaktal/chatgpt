@@ -25,6 +25,7 @@ class ChatDatabase {
         conversation_id TEXT,
         role TEXT,
         content TEXT,
+        metadata_json TEXT,
         created_at DATETIME,
         parent_id TEXT,
         FOREIGN KEY (conversation_id) REFERENCES conversations(id)
@@ -44,6 +45,7 @@ class ChatDatabase {
 
     // Migrations
     const tableInfo = this.db.prepare("PRAGMA table_info(conversations)").all();
+    const messagesTableInfo = this.db.prepare("PRAGMA table_info(messages)").all();
     
     const hasCurrentNode = tableInfo.some(col => col.name === 'current_node_id');
     if (!hasCurrentNode) {
@@ -53,6 +55,11 @@ class ChatDatabase {
     const hasDeletedOnWeb = tableInfo.some(col => col.name === 'is_deleted_on_web');
     if (!hasDeletedOnWeb) {
       this.db.exec("ALTER TABLE conversations ADD COLUMN is_deleted_on_web INTEGER DEFAULT 0");
+    }
+
+    const hasMetadataJson = messagesTableInfo.some(col => col.name === 'metadata_json');
+    if (!hasMetadataJson) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN metadata_json TEXT");
     }
   }
 
@@ -70,12 +77,12 @@ class ChatDatabase {
 
   getLinearPath(currentNodeId) {
     return this.db.prepare(`
-      WITH RECURSIVE chat_path(id, conversation_id, role, content, created_at, parent_id) AS (
-        SELECT id, conversation_id, role, content, created_at, parent_id
+      WITH RECURSIVE chat_path(id, conversation_id, role, content, metadata_json, created_at, parent_id) AS (
+        SELECT id, conversation_id, role, content, metadata_json, created_at, parent_id
         FROM messages
         WHERE id = ?
         UNION ALL
-        SELECT m.id, m.conversation_id, m.role, m.content, m.created_at, m.parent_id
+        SELECT m.id, m.conversation_id, m.role, m.content, m.metadata_json, m.created_at, m.parent_id
         FROM messages m
         JOIN chat_path cp ON m.id = cp.parent_id
       )
@@ -112,12 +119,21 @@ class ChatDatabase {
 
   upsertMessage(msg) {
     const stmt = this.db.prepare(`
-      INSERT INTO messages (id, conversation_id, role, content, created_at, parent_id)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at, parent_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
-        content = excluded.content
+        content = excluded.content,
+        metadata_json = excluded.metadata_json
     `);
-    stmt.run(msg.id, msg.conversation_id, msg.role, msg.content, msg.created_at, msg.parent_id);
+    stmt.run(
+      msg.id,
+      msg.conversation_id,
+      msg.role,
+      msg.content,
+      msg.metadata_json ?? null,
+      msg.created_at,
+      msg.parent_id
+    );
   }
 
   searchMessages(query) {

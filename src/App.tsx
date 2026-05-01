@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, memo, useCallback } from 'react';
+import React, { useState, useEffect, useRef, memo, useCallback, useMemo } from 'react';
 import type { Conversation, Message } from './types';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -16,6 +16,8 @@ const escapeRegExp = (string: string) => {
 
 const getMessagePreview = (content: string) => {
   const normalized = content
+    .replace(/cite[^]*/g, ' ')
+    .replace(/products[\s\S]*?(?:|$)/g, ' ')
     .replace(/!\[[^\]]*]\([^)]+\)/g, ' [image] ')
     .replace(/```[\s\S]*?```/g, ' [code] ')
     .replace(/`[^`]*`/g, ' ')
@@ -37,8 +39,343 @@ const normalizeMathDelimiters = (content: string) => {
     .join('');
 };
 
+const normalizeCitationMarkers = (content: string) => {
+  const citationOrder = new Map<string, number>();
+  let nextCitation = 1;
+
+  const citationNumber = (id: string) => {
+    if (!citationOrder.has(id)) citationOrder.set(id, nextCitation++);
+    return citationOrder.get(id)!;
+  };
+
+  return content
+    .replace(/cite([^]+)/g, (_match, rawRefs: string) => {
+      const refs = rawRefs
+        .split('')
+        .map((ref) => ref.trim())
+        .filter(Boolean);
+      if (refs.length === 0) return '';
+      return refs.map((id) => {
+        const n = citationNumber(id);
+        return `[${n}](citation://${id})`;
+      }).join(' ');
+    })
+    .replace(/cite/g, '')
+    .replace(//g, '');
+};
+
+const normalizeProductsMarkers = (content: string) => {
+  return content.replace(/products(\{[\s\S]*?\})(?:|$)/g, (_match, rawJson: string) => {
+    try {
+      const parsed = JSON.parse(rawJson) as { selections?: unknown; tags?: unknown };
+      const selections = Array.isArray(parsed?.selections) ? parsed.selections : [];
+      const tags = Array.isArray(parsed?.tags) ? parsed.tags : [];
+      if (selections.length === 0) return '';
+
+      const lines = ['\n**Products**\n'];
+      selections.forEach((item, idx) => {
+        if (!Array.isArray(item) || item.length < 2) return;
+        const id = typeof item[0] === 'string' ? item[0].trim() : '';
+        const label = typeof item[1] === 'string' ? item[1].trim() : '';
+        if (!label) return;
+        const tag = typeof tags[idx] === 'string' ? tags[idx].trim() : '';
+
+        const prefix = `${idx + 1}. `;
+        const product = id ? `[${label}](productref://${encodeURIComponent(id)})` : label;
+        lines.push(tag ? `${prefix}${product} - ${tag}` : `${prefix}${product}`);
+      });
+
+      return lines.join('\n');
+    } catch {
+      return '';
+    }
+  });
+};
+
 const isNavigableMessage = (msg: Message) =>
   (msg.role === 'user' || msg.role === 'assistant') && !!msg.content?.trim();
+
+type ThinkingPart = Pick<Message, 'id' | 'role' | 'content'>;
+type DisplayMessage = Message & { thinkingParts?: ThinkingPart[] };
+type CitationEntry = { id: string; url?: string; title?: string };
+
+const formatSendError = (error: unknown) => {
+  const message = typeof error === 'string'
+    ? error
+    : (error && typeof error === 'object' && 'message' in error && typeof (error as { message?: unknown }).message === 'string'
+      ? (error as { message: string }).message
+      : 'Failed to send message.');
+
+  if (/unusual activity has been detected/i.test(message)) {
+    return 'Send blocked by ChatGPT (403 unusual activity). Complete any verification on chatgpt.com, then retry. If it persists, wait a few minutes and try again.';
+  }
+  return message;
+};
+
+const summarizeMetadataOnlyStep = (msg: Message) => {
+  if (!msg.metadata_json) return '';
+  try {
+    const meta = JSON.parse(msg.metadata_json) as Record<string, any>;
+    const lines: string[] = [];
+
+    if (typeof meta.reasoning_title === 'string' && meta.reasoning_title.trim()) {
+      lines.push(`Reasoning: ${meta.reasoning_title.trim()}`);
+    } else if (typeof meta.reasoning_status === 'string' && meta.reasoning_status.trim()) {
+      lines.push(`Reasoning status: \`${meta.reasoning_status.trim()}\``);
+    }
+    if (meta.is_thinking_preamble_message) lines.push('Thinking preamble step');
+    if (meta.is_visually_hidden_from_conversation) lines.push('Hidden internal step');
+
+    if (meta.aggregate_result && typeof meta.aggregate_result === 'object') {
+      const status = typeof meta.aggregate_result.status === 'string' ? meta.aggregate_result.status : 'available';
+      lines.push(`Tool aggregate result: \`${status}\``);
+    } else if (msg.role === 'tool') {
+      lines.push('Tool step (no text output)');
+    }
+
+    if (lines.length === 0 && meta.finish_details && typeof meta.finish_details.type === 'string') {
+      lines.push(`Finish: \`${meta.finish_details.type}\``);
+    }
+
+    return lines.join('\n');
+  } catch {
+    return '';
+  }
+};
+
+const assistantCandidateScore = (content: string) => {
+  const text = content.trim();
+  if (!text) return -Infinity;
+  let score = Math.min(text.length, 20000);
+  if (text.startsWith('{') && text.includes('"prompt"')) score -= 7000;
+  if (text.startsWith('{') && text.includes('"size"')) score -= 7000;
+  if (text.startsWith('```')) score -= 4000;
+  if (text.startsWith('[Download')) score -= 1500;
+  return score;
+};
+
+const buildCitationRegistry = (rawMessages: Message[]): Record<string, CitationEntry> => {
+  const registry: Record<string, CitationEntry> = {};
+  const markerIdPattern = 'turn\\d+[a-z]+\\d+';
+  const trimPunctuation = (value: string) => value.replace(/[),.;!?]+$/, '');
+  const citationIdRegex = /turn\d+[a-z]+\d+/i;
+  const urlRegex = /https?:\/\/[^\s)\]}>"']+/i;
+
+  const ensureEntry = (id: string) => {
+    if (!registry[id]) registry[id] = { id };
+    return registry[id];
+  };
+
+  const firstCitationId = (value: unknown) => {
+    if (typeof value !== 'string') return null;
+    const match = value.match(citationIdRegex);
+    return match ? match[0] : null;
+  };
+
+  const firstUrl = (value: unknown) => {
+    if (typeof value !== 'string') return null;
+    const match = value.match(urlRegex);
+    return match ? trimPunctuation(match[0]) : null;
+  };
+
+  const collectFromMetadata = (value: unknown, seen: Set<string>, depth = 0) => {
+    if (!value || depth > 12) return;
+
+    if (Array.isArray(value)) {
+      for (const item of value) collectFromMetadata(item, seen, depth + 1);
+      return;
+    }
+    if (typeof value !== 'object') return;
+
+    const obj = value as Record<string, unknown>;
+    const stringValues = Object.values(obj).filter((v): v is string => typeof v === 'string');
+
+    // ChatGPT metadata often stores citation ids in matched_text and URLs in safe_urls.
+    const matchedText = typeof obj.matched_text === 'string' ? obj.matched_text : '';
+    const safeUrls = Array.isArray(obj.safe_urls)
+      ? obj.safe_urls.filter((u): u is string => typeof u === 'string').map((u) => trimPunctuation(u.trim())).filter(Boolean)
+      : [];
+    if (matchedText && safeUrls.length > 0) {
+      const ids = Array.from(matchedText.matchAll(/turn\d+[a-z]+\d+/gi)).map((m) => m[0]);
+      ids.forEach((id, idx) => {
+        const url = safeUrls[idx] || safeUrls[0];
+        if (!url) return;
+        const dedupeKey = `${id}|${url}`;
+        if (seen.has(dedupeKey)) return;
+        seen.add(dedupeKey);
+        const entry = ensureEntry(id);
+        if (!entry.url) entry.url = url;
+      });
+    }
+
+    const id =
+      firstCitationId(obj.ref_id)
+      || firstCitationId(obj.citation_id)
+      || firstCitationId(obj.source_id)
+      || firstCitationId(obj.id)
+      || stringValues.map((v) => firstCitationId(v)).find(Boolean)
+      || null;
+
+    const url =
+      firstUrl(obj.url)
+      || firstUrl(obj.href)
+      || firstUrl(obj.link)
+      || firstUrl(obj.uri)
+      || stringValues.map((v) => firstUrl(v)).find(Boolean)
+      || null;
+
+    if (id && url) {
+      const dedupeKey = `${id}|${url}`;
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        const entry = ensureEntry(id);
+        if (!entry.url) entry.url = url;
+        if (!entry.title) {
+          const title = typeof obj.title === 'string'
+            ? obj.title.trim()
+            : typeof obj.name === 'string'
+              ? obj.name.trim()
+              : '';
+          if (title) entry.title = title;
+        }
+      }
+    }
+
+    for (const nested of Object.values(obj)) {
+      if (nested && typeof nested === 'object') {
+        collectFromMetadata(nested, seen, depth + 1);
+      }
+    }
+  };
+
+  const metadataSeen = new Set<string>();
+  for (const msg of rawMessages) {
+    if (!msg.metadata_json) continue;
+    try {
+      const parsed = JSON.parse(msg.metadata_json);
+      collectFromMetadata(parsed, metadataSeen);
+    } catch {
+      // Ignore malformed cached metadata.
+    }
+  }
+
+  const searchableMessages = rawMessages.filter((m) => m.content && m.content.trim());
+
+  for (const msg of searchableMessages) {
+    const text = msg.content;
+
+    const inlinePattern = new RegExp(`([^\\n]{0,240}?)\\((https?:\\/\\/[^\\s)]+)\\)\\s*【(${markerIdPattern})】`, 'g');
+    let inlineMatch: RegExpExecArray | null;
+    while ((inlineMatch = inlinePattern.exec(text)) !== null) {
+      const title = inlineMatch[1].replace(/^[\s*\-•]+/, '').trim();
+      const url = trimPunctuation(inlineMatch[2].trim());
+      const id = inlineMatch[3].trim();
+      const entry = ensureEntry(id);
+      if (!entry.url) entry.url = url;
+      if (!entry.title && title) entry.title = title;
+    }
+
+    const markdownLinkWithMarkerPattern = new RegExp(`\\[([^\\]]{1,240})\\]\\((https?:\\/\\/[^\\s)]+)\\)\\s*【(${markerIdPattern})】`, 'g');
+    let mdMatch: RegExpExecArray | null;
+    while ((mdMatch = markdownLinkWithMarkerPattern.exec(text)) !== null) {
+      const title = mdMatch[1].trim();
+      const url = trimPunctuation(mdMatch[2].trim());
+      const id = mdMatch[3].trim();
+      const entry = ensureEntry(id);
+      if (!entry.url) entry.url = url;
+      if (!entry.title && title) entry.title = title;
+    }
+
+    const rawUrlWithMarkerPattern = new RegExp(`(https?:\\/\\/\\S+)\\s*【(${markerIdPattern})】`, 'g');
+    let rawMatch: RegExpExecArray | null;
+    while ((rawMatch = rawUrlWithMarkerPattern.exec(text)) !== null) {
+      const url = trimPunctuation(rawMatch[1].trim());
+      const id = rawMatch[2].trim();
+      const entry = ensureEntry(id);
+      if (!entry.url) entry.url = url;
+    }
+
+    const markerPattern = new RegExp(`【(${markerIdPattern})】`, 'g');
+    let markerMatch: RegExpExecArray | null;
+    while ((markerMatch = markerPattern.exec(text)) !== null) {
+      const id = markerMatch[1];
+      const entry = ensureEntry(id);
+      if (entry.url) continue;
+
+      const markerIndex = markerMatch.index;
+      const windowStart = Math.max(0, markerIndex - 500);
+      const windowEnd = Math.min(text.length, markerIndex + 500);
+      const windowText = text.slice(windowStart, windowEnd);
+      const urls = [...windowText.matchAll(/https?:\/\/[^\s)\]]+/g)];
+      if (urls.length === 0) continue;
+
+      const nearest = urls.reduce((best, current) => {
+        const currentIndex = windowStart + (current.index || 0);
+        const bestIndex = windowStart + (best.index || 0);
+        return Math.abs(currentIndex - markerIndex) < Math.abs(bestIndex - markerIndex) ? current : best;
+      });
+
+      entry.url = trimPunctuation(nearest[0].trim());
+
+      const lineStart = text.lastIndexOf('\n', markerIndex);
+      const line = text.slice(lineStart + 1, markerIndex).trim();
+      if (!entry.title && line) {
+        entry.title = line.replace(/^[\d.\s*\-•]+/, '').trim();
+      }
+    }
+  }
+
+  return registry;
+};
+
+const buildDisplayMessages = (rawMessages: Message[]): DisplayMessage[] => {
+  const output: DisplayMessage[] = [];
+  const segmentable = rawMessages.filter((m) => (m.content && m.content.trim()) || !!m.metadata_json);
+
+  const flushSegment = (segment: Message[]) => {
+    if (segment.length === 0) return;
+    const userMessages = segment.filter((m) => m.role === 'user' && m.content && m.content.trim());
+    const assistantMessages = segment.filter((m) => m.role === 'assistant' && m.content && m.content.trim());
+
+    userMessages.forEach((m) => output.push({ ...m }));
+    if (assistantMessages.length === 0) return;
+
+    const lastAssistant = assistantMessages[assistantMessages.length - 1];
+    const strongestAssistant = assistantMessages.reduce((best, current) => {
+      return assistantCandidateScore(current.content) > assistantCandidateScore(best.content) ? current : best;
+    }, assistantMessages[0]);
+    const finalAssistant =
+      assistantCandidateScore(lastAssistant.content) >= assistantCandidateScore(strongestAssistant.content) * 0.55
+        ? lastAssistant
+        : strongestAssistant;
+    const thinkingParts = segment
+      .filter((m) => m.id !== finalAssistant.id && m.role !== 'user')
+      .map((m) => {
+        const visible = (m.content || '').trim();
+        const content = visible ? m.content : summarizeMetadataOnlyStep(m);
+        return { id: m.id, role: m.role, content };
+      })
+      .filter((m) => !!m.content?.trim());
+
+    output.push({
+      ...finalAssistant,
+      thinkingParts: thinkingParts.length > 0 ? thinkingParts : undefined,
+    });
+  };
+
+  let segment: Message[] = [];
+  for (const msg of segmentable) {
+    if (msg.role === 'user' && segment.length > 0) {
+      flushSegment(segment);
+      segment = [msg];
+    } else {
+      segment.push(msg);
+    }
+  }
+  flushSegment(segment);
+
+  return output;
+};
 
 const HighlightText = ({ children, query }: { children: React.ReactNode, query: string }): any => {
   if (!query || !query.trim()) return children;
@@ -93,15 +430,40 @@ const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: any) => 
   return <img src={resolvedSrc} alt={alt || 'Image'} loading="lazy" onError={handleError} onClick={handleClick} {...props} />;
 };
 
-const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenImage }: { content: string, highlightQuery?: string, conversationId?: string, onOpenImage?: (src: string) => void }) => {
+const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenImage, citationRegistry }: { content: string, highlightQuery?: string, conversationId?: string, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
   const query = highlightQuery || '';
-  const renderedContent = normalizeMathDelimiters(content);
+  const renderedContent = normalizeMathDelimiters(normalizeCitationMarkers(normalizeProductsMarkers(content)));
   return (
     <ReactMarkdown
       urlTransform={(value: string) => value}
       remarkPlugins={[remarkGfm, remarkMath]}
       rehypePlugins={[rehypeKatex]}
       components={{
+        a: ({ href, children, ...props }) => {
+          if (typeof href === 'string' && href.startsWith('productref://')) {
+            const id = decodeURIComponent(href.replace('productref://', ''));
+            const entry = citationRegistry[id];
+            if (entry?.url) {
+              return <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id} {...props}>{children}</a>;
+            }
+            return <span title={id}>{children}</span>;
+          }
+          if (typeof href === 'string' && href.startsWith('citation://')) {
+            const id = decodeURIComponent(href.replace('citation://', ''));
+            const entry = citationRegistry[id];
+            if (entry?.url) {
+              return (
+                <sup className="citation-ref">
+                  <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id}>
+                    {children}
+                  </a>
+                </sup>
+              );
+            }
+            return <sup className="citation-ref" title={id}>{children}</sup>;
+          }
+          return <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>;
+        },
         p: ({ children, ...props }) => <p {...props}><HighlightText query={query}>{children}</HighlightText></p>,
         li: ({ children, ...props }) => <li {...props}><HighlightText query={query}>{children}</HighlightText></li>,
         h1: ({ children, ...props }) => <h1 {...props}><HighlightText query={query}>{children}</HighlightText></h1>,
@@ -136,13 +498,28 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
   );
 });
 
-const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage }: { msg: Message, highlightQuery?: string, isTarget?: boolean, onOpenImage?: (src: string) => void }) => {
+const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationRegistry }: { msg: DisplayMessage, highlightQuery?: string, isTarget?: boolean, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
   return (
     <div className={`message-row ${msg.role} ${isTarget ? 'highlight-target' : ''}`} data-message-id={msg.id}>
       <div className="message-content">
         <div className="role-label">{msg.role === 'user' ? 'You' : 'ChatGPT'}</div>
+        {msg.role === 'assistant' && msg.thinkingParts && msg.thinkingParts.length > 0 ? (
+          <details className="thinking-box">
+            <summary>Thinking</summary>
+            <div className="thinking-content">
+              {msg.thinkingParts.map((part) => (
+                <div key={part.id} className="thinking-item">
+                  <div className="thinking-role">{part.role}</div>
+                  <div className="markdown-body">
+                    <MarkdownMessage content={part.content} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </details>
+        ) : null}
         <div className="markdown-body">
-          <MarkdownMessage content={msg.content} highlightQuery={isTarget ? highlightQuery : undefined} conversationId={msg.conversation_id} onOpenImage={onOpenImage} />
+          <MarkdownMessage content={msg.content} highlightQuery={isTarget ? highlightQuery : undefined} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
         </div>
       </div>
     </div>
@@ -176,7 +553,11 @@ function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [selectedModel, setSelectedModel] = useState<string>(localStorage.getItem('selectedModel') || 'Auto');
   const [pastedImage, setPastedImage] = useState<string | null>(null);
+  const [attachedFiles, setAttachedFiles] = useState<Array<{ id: string; name: string; mimeType: string; dataUrl: string; sizeBytes: number }>>([]);
   const [inputValue, setInputValue] = useState('');
+  const [isSending, setIsSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [isReauthenticating, setIsReauthenticating] = useState(false);
 
   const [fontSize, setFontSize] = useState<number>(Number(localStorage.getItem('fontSize')) || 12);
   const [chatWidth, setChatWidth] = useState<number>(Number(localStorage.getItem('chatWidth')) || 800);
@@ -206,13 +587,17 @@ function App() {
   const panRaf = useRef<number | null>(null);
   const panScrollTargetRef = useRef<HTMLElement | null>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
+  const conversationsScrollerRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const activeConvIdRef = useRef<string | null>(localStorage.getItem('lastConvId'));
   const hasScrolledToBottomRef = useRef<Record<string, boolean>>({});
   const virtuosoStateByConversationRef = useRef<Record<string, any>>({});
   const [restoreVirtuosoState, setRestoreVirtuosoState] = useState<any | null>(null);
+  const displayMessages = useMemo(() => buildDisplayMessages(messages), [messages]);
+  const citationRegistry = useMemo(() => buildCitationRegistry(messages), [messages]);
 
   const saveVirtuosoState = useCallback((conversationId: string | null) => {
     if (!conversationId || !virtuosoRef.current?.getState) return;
@@ -278,12 +663,13 @@ function App() {
     activeConvIdRef.current = id;
     const localMsgs = await window.electronAPI.invoke('db:getMessages', id);
     setMessages(localMsgs);
-    if (!shouldSync) {
+    const shouldSyncNow = shouldSync || localMsgs.length === 0;
+    if (!shouldSyncNow) {
       setIsSyncing(false);
       return;
     }
     setIsSyncing(true);
-    window.electronAPI.invoke('api:syncMessages', id)
+    window.electronAPI.invoke('api:syncMessages', { conversationId: id, force: forceSync })
       .then((syncedMsgs: Message[]) => {
         if (activeConvIdRef.current === id) {
           setMessages(prev => {
@@ -298,41 +684,102 @@ function App() {
       });
   }, [saveVirtuosoState]);
 
+  const handleReauth = useCallback(async () => {
+    if (isReauthenticating) return;
+    setIsReauthenticating(true);
+    try {
+      const success = await window.electronAPI.invoke('auth:reauth');
+      if (!success) {
+        setSendError('Re-authentication was cancelled or failed.');
+        return;
+      }
+      await checkAuth();
+      if (activeConvIdRef.current) {
+        await selectConversation(activeConvIdRef.current, true, true);
+      }
+      setSendError(null);
+    } catch (error) {
+      console.error('Re-authentication failed', error);
+      setSendError('Re-authentication failed. Please try again.');
+    } finally {
+      setIsReauthenticating(false);
+    }
+  }, [checkAuth, isReauthenticating, selectConversation]);
+
   const handleSend = async () => {
-    if (!inputValue.trim() && !pastedImage) return;
-    const userMsg: Message = {
-      id: crypto.randomUUID(),
-      conversation_id: activeConvId || '',
-      role: 'user',
-      content: inputValue,
-      created_at: Date.now() / 1000,
-    };
-    setMessages(prev => [...prev, userMsg]);
-    setInputValue('');
+    if (isSending || (!inputValue.trim() && !pastedImage && attachedFiles.length === 0)) return;
+    const outgoingContent = inputValue;
     const currentImage = pastedImage;
-    setPastedImage(null);
+    const currentFiles = attachedFiles;
     const modelMap: Record<string, string> = {
       'Auto': 'auto', 'Instant 5.3': 'gpt-4o', 'Thinking 5.4 Standard': 'o1-mini',
       'Thinking 5.4 Extended': 'o1', 'Thinking 5.5 Standard': 'o3-mini', 'Thinking 5.5 Extended': 'o1',
     };
+    setSendError(null);
+    setIsSending(true);
     try {
       await window.electronAPI.invoke('api:sendMessage', {
         conversationId: activeConvId,
-        content: userMsg.content,
+        content: outgoingContent,
         model: modelMap[selectedModel] || 'auto',
-        parentMessageId: messages.length > 0 ? messages[messages.length - 1].id : undefined,
-        image: currentImage
+        image: currentImage,
+        files: currentFiles.map((f) => ({
+          name: f.name,
+          mimeType: f.mimeType,
+          dataUrl: f.dataUrl,
+          sizeBytes: f.sizeBytes,
+        })),
       });
       if (activeConvId) {
-        const updatedMsgs = await window.electronAPI.invoke('api:syncMessages', activeConvId);
+        const updatedMsgs = await window.electronAPI.invoke('api:syncMessages', { conversationId: activeConvId, force: true });
+        const textNeedle = outgoingContent.trim();
+        const userMessageConfirmed = !textNeedle || updatedMsgs.some((m: Message) => {
+          if (m.role !== 'user') return false;
+          return (m.content || '').includes(textNeedle);
+        });
+        if (!userMessageConfirmed) {
+          setSendError('Send could not be verified in this chat. Your draft was kept so you can retry.');
+          setMessages(updatedMsgs);
+          return;
+        }
+        setInputValue('');
+        setPastedImage(null);
+        setAttachedFiles([]);
         setMessages(updatedMsgs);
       } else {
+        setInputValue('');
+        setPastedImage(null);
+        setAttachedFiles([]);
         loadConversations();
       }
     } catch (error) {
       console.error('Failed to send message', error);
+      setSendError(formatSendError(error));
+    } finally {
+      setIsSending(false);
     }
   };
+
+  const handleAttachFiles = useCallback(async (list: FileList | null) => {
+    if (!list || list.length === 0) return;
+    const fileArray = Array.from(list);
+    const mapped = await Promise.all(fileArray.map(async (file) => {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
+        reader.readAsDataURL(file);
+      });
+      return {
+        id: crypto.randomUUID(),
+        name: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        dataUrl,
+        sizeBytes: file.size,
+      };
+    }));
+    setAttachedFiles((prev) => [...prev, ...mapped]);
+  }, []);
 
   const handleSearch = async (q: string) => {
     setSearchQuery(q);
@@ -341,7 +788,7 @@ function App() {
       return;
     }
     const results = await window.electronAPI.invoke('db:searchMessages', q);
-    setSearchResults(results);
+    setSearchResults(results.filter((r: any) => r.role === 'user' || r.role === 'assistant'));
   };
 
   const jumpToMessage = (e: React.MouseEvent, convId: string, msgId: string) => {
@@ -447,9 +894,9 @@ function App() {
   }, [selectedModel]);
 
   useEffect(() => {
-    if (activeConvId && messages.length > 0) {
+    if (activeConvId && displayMessages.length > 0) {
       if (targetMessageId) {
-        const index = messages.findIndex(m => m.id === targetMessageId);
+        const index = displayMessages.findIndex(m => m.id === targetMessageId);
         if (index !== -1) {
           const timer = setTimeout(() => {
             virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' });
@@ -459,13 +906,13 @@ function App() {
         }
       } else if (!hasScrolledToBottomRef.current[activeConvId] && !virtuosoStateByConversationRef.current[activeConvId]) {
         const timer = setTimeout(() => {
-          virtuosoRef.current?.scrollToIndex({ index: messages.length - 1, align: 'end', behavior: 'auto' });
+          virtuosoRef.current?.scrollToIndex({ index: displayMessages.length - 1, align: 'end', behavior: 'auto' });
           hasScrolledToBottomRef.current[activeConvId] = true;
         }, 100);
         return () => clearTimeout(timer);
       }
     }
-  }, [messages, activeConvId, targetMessageId]);
+  }, [displayMessages, activeConvId, targetMessageId]);
 
   useEffect(() => {
     let timer: number;
@@ -629,7 +1076,7 @@ function App() {
     const scrollerRect = scroller.getBoundingClientRect();
     const viewportTop = scrollerRect.top;
     const rows = Array.from(scroller.querySelectorAll<HTMLElement>('.message-row[data-message-id]'));
-    const navigableIds = new Set(messages.filter(isNavigableMessage).map((m) => m.id));
+    const navigableIds = new Set(displayMessages.filter(isNavigableMessage).map((m) => m.id));
     let nextId: string | null = null;
 
     for (const row of rows) {
@@ -665,7 +1112,7 @@ function App() {
     }
 
     setViewportNavMessageId((prev) => (prev === nextId ? prev : nextId));
-  }, [messages]);
+  }, [displayMessages]);
 
   const handleMessageRangeChanged = useCallback(() => {
     updateViewportNavHighlight();
@@ -694,7 +1141,7 @@ function App() {
   useEffect(() => {
     const timer = window.setTimeout(() => updateViewportNavHighlight(), 0);
     return () => window.clearTimeout(timer);
-  }, [messages, updateViewportNavHighlight]);
+  }, [displayMessages, updateViewportNavHighlight]);
 
   if (isAuth === null) return <div className="auth-overlay">Loading...</div>;
   if (isAuth === false) return (
@@ -705,10 +1152,12 @@ function App() {
     </div>
   );
 
-  const navigationMessages = messages
+  const navigationMessages = displayMessages
     .filter(isNavigableMessage)
     .map((m, i) => ({ ...m, navIndex: i + 1, preview: getMessagePreview(m.content) }));
   const activeMapMessageId = isMessageMapOpen ? viewportNavMessageId : targetMessageId;
+  const trimmedSearchQuery = searchQuery.trim();
+  const searchMatchCount = trimmedSearchQuery ? searchResults.length : 0;
 
   return (
     <div className="app-container">
@@ -726,8 +1175,11 @@ function App() {
             </button>
           </div>
         </div>
-        <div className="conversations-list">
-          <Virtuoso data={conversations} endReached={loadMoreConversations} 
+        <div className="conversations-list" onMouseDown={(e) => startPanning(e, conversationsScrollerRef.current || (e.currentTarget as HTMLElement))}>
+          <Virtuoso
+            data={conversations}
+            endReached={loadMoreConversations}
+            scrollerRef={(el) => { conversationsScrollerRef.current = (el as HTMLElement) || null; }}
             itemContent={(_index, conv) => (
               <ConversationItem 
                 key={conv.id} 
@@ -778,9 +1230,6 @@ function App() {
             <button className="sync-btn-sidebar" onClick={() => activeConvId && selectConversation(activeConvId, true, true)} title="Sync current chat">
               <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
             </button>
-            <button className="sync-btn-sidebar" onClick={handleAudit} title="Audit Web Deletions (Check for missing chats)">
-              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
-            </button>
             <button className="settings-btn" onClick={() => setShowSettings(true)}>
               <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
               Settings
@@ -793,8 +1242,8 @@ function App() {
           <div className="chat-pane">
             {isSyncing && <div className="sync-indicator">Syncing...</div>}
             <div className="messages-container" onMouseDown={(e) => startPanning(e, scrollerRef.current)}>
-              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={(el) => { scrollerRef.current = el as HTMLElement; setMessageScrollerEl((el as HTMLElement) || null); }} data={messages} initialTopMostItemIndex={messages.length > 0 ? messages.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} rangeChanged={handleMessageRangeChanged}
-                itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} highlightQuery={activeHighlightQuery} isTarget={targetMessageId === msg.id} onOpenImage={setFullscreenImage} />}
+              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={(el) => { scrollerRef.current = el as HTMLElement; setMessageScrollerEl((el as HTMLElement) || null); }} data={displayMessages} initialTopMostItemIndex={displayMessages.length > 0 ? displayMessages.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} rangeChanged={handleMessageRangeChanged}
+                itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} highlightQuery={activeHighlightQuery} isTarget={targetMessageId === msg.id} onOpenImage={setFullscreenImage} citationRegistry={citationRegistry} />}
               />
             </div>
           </div>
@@ -826,22 +1275,126 @@ function App() {
           </aside>
         </div>
         <div className="input-area">
-          <div className="input-container">
-            {pastedImage && <div className="image-preview"><img src={pastedImage} alt="Pasted" /><button className="remove-image" onClick={() => setPastedImage(null)}>×</button></div>}
-            <div className="input-wrapper">
-              <div className="model-picker-container">
-                <button className={`model-picker-trigger ${showModelMenu ? 'active' : ''}`} onClick={() => setShowModelMenu(!showModelMenu)} title="Select Model"><svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M7 14l5-5 5 5z"/></svg></button>
-                {showModelMenu && <div className="model-picker-menu">{['Auto', 'Instant 5.3', 'Thinking 5.4 Standard', 'Thinking 5.4 Extended', 'Thinking 5.5 Standard', 'Thinking 5.5 Extended'].map(m => <button key={m} className={`model-picker-option ${selectedModel === m ? 'active' : ''}`} onClick={() => { setSelectedModel(m); setShowModelMenu(false); }}>{m}</button>)}</div>}
-              </div>
+            <div className="input-container">
+              {sendError && (
+                <div className="send-error-banner">
+                  <span>{sendError}</span>
+                  <button className="send-error-dismiss" onClick={() => setSendError(null)} aria-label="Dismiss send error">×</button>
+                </div>
+              )}
+              {pastedImage && <div className="image-preview"><img src={pastedImage} alt="Pasted" /><button className="remove-image" onClick={() => setPastedImage(null)}>×</button></div>}
+              {attachedFiles.length > 0 && (
+                <div className="file-preview-list">
+                  {attachedFiles.map((file) => (
+                    <div key={file.id} className="file-preview-chip" title={file.name}>
+                      <span className="file-preview-name">{file.name}</span>
+                      <button className="file-preview-remove" onClick={() => setAttachedFiles((prev) => prev.filter((f) => f.id !== file.id))}>×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  handleAttachFiles(e.target.files).catch((err) => console.error('Attach failed', err));
+                  e.currentTarget.value = '';
+                }}
+              />
+              <div className="input-wrapper">
+                <div className="model-picker-container">
+                  <button className={`model-picker-trigger ${showModelMenu ? 'active' : ''}`} onClick={() => setShowModelMenu(!showModelMenu)} title="Select Model"><svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M7 14l5-5 5 5z"/></svg></button>
+                  <button className="attach-btn" onClick={() => fileInputRef.current?.click()} title="Attach files">
+                    <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M16.5 6.5l-7.79 7.79a2 2 0 1 0 2.83 2.83l7.08-7.08a4 4 0 1 0-5.66-5.66L5.17 12.17a6 6 0 1 0 8.49 8.49l6.36-6.36-1.41-1.41-6.36 6.36a4 4 0 1 1-5.66-5.66l7.79-7.79a2 2 0 1 1 2.83 2.83l-7.08 7.08-.71-.71 6.72-6.72 1.41 1.41-6.72 6.72a2 2 0 0 1-2.83-2.83l7.79-7.79 1.41 1.41z"/></svg>
+                  </button>
+                  {showModelMenu && <div className="model-picker-menu">{['Auto', 'Instant 5.3', 'Thinking 5.4 Standard', 'Thinking 5.4 Extended', 'Thinking 5.5 Standard', 'Thinking 5.5 Extended'].map(m => <button key={m} className={`model-picker-option ${selectedModel === m ? 'active' : ''}`} onClick={() => { setSelectedModel(m); setShowModelMenu(false); }}>{m}</button>)}</div>}
+                </div>
               <textarea ref={textareaRef} className="chat-input" placeholder="Send a message..." rows={1} value={inputValue} onChange={(e) => setInputValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }} />
-              <button className="send-btn" onClick={handleSend} disabled={!inputValue.trim() && !pastedImage}><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+              <button className="send-btn" onClick={handleSend} disabled={isSending || (!inputValue.trim() && !pastedImage && attachedFiles.length === 0)}><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
             </div>
           </div>
         </div>
       </div>
-      {showSettings && <div className="modal-backdrop" onClick={() => setShowSettings(false)}><div className="settings-modal" onClick={e => e.stopPropagation()}><div className="modal-header"><h2>Settings</h2><button className="close-modal" onClick={() => setShowSettings(false)}>×</button></div><div className="setting-item"><label>Font Size <span className="setting-value">{fontSize}pt</span></label><input type="range" min="8" max="20" value={fontSize} onChange={(e) => setFontSize(parseInt(e.target.value))} /></div><div className="setting-item"><label>Chat Column Width <span className="setting-value">{chatWidth}px</span></label><input type="range" min="400" max="5000" step="50" value={chatWidth} onChange={(e) => setChatWidth(parseInt(e.target.value))} /></div></div></div>}
-      {showSearch && <div className="modal-backdrop" onClick={() => setShowSearch(false)}><div className="search-modal" onClick={e => e.stopPropagation()}><div className="modal-header"><h2>Search Conversations</h2><button className="close-modal" onClick={() => setShowSearch(false)}>×</button></div><div className="search-input-container"><input autoFocus type="text" placeholder="Search all messages..." value={searchQuery} onChange={(e) => handleSearch(e.target.value)} /></div><div className="search-results">{searchResults.length === 0 && searchQuery.trim() !== '' && <div className="no-results">No messages found matching "{searchQuery}"</div>}{searchResults.map(res => (
-        <div key={res.id} className="search-result-item" onClick={(e) => jumpToMessage(e, res.conversation_id, res.id)}><div className="search-result-header"><span className="search-result-title">{res.conversation_title}</span><span className="search-result-role">{res.role}</span></div><div className="search-result-content">{(() => { const text = res.content; const idx = text.toLowerCase().indexOf(searchQuery.toLowerCase()); const start = Math.max(0, idx - 60); const end = Math.min(text.length, idx + 100); const preview = (start > 0 ? '...' : '') + text.substring(start, end) + (end < text.length ? '...' : ''); const escaped = escapeRegExp(searchQuery); const parts = preview.split(new RegExp(`(${escaped})`, 'gi')); return parts.map((part, i) => part.toLowerCase() === searchQuery.toLowerCase() ? <span key={i} className="search-highlight">{part}</span> : part); })()}</div></div>))}</div></div></div>}
+      {showSettings && (
+        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+          <div className="settings-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Settings</h2>
+              <button className="close-modal" onClick={() => setShowSettings(false)}>×</button>
+            </div>
+            <div className="setting-item">
+              <label>Font Size <span className="setting-value">{fontSize}pt</span></label>
+              <input type="range" min="8" max="20" value={fontSize} onChange={(e) => setFontSize(parseInt(e.target.value))} />
+            </div>
+            <div className="setting-item">
+              <label>Chat Column Width <span className="setting-value">{chatWidth}px</span></label>
+              <input type="range" min="400" max="5000" step="50" value={chatWidth} onChange={(e) => setChatWidth(parseInt(e.target.value))} />
+            </div>
+            <div className="setting-item">
+              <label>Account & Sync</label>
+              <div className="settings-action-list">
+                <button className="settings-action-btn" onClick={handleAudit} title="Check for chats deleted on web and mark local cache accordingly">
+                  Check for auto deletions
+                </button>
+                <button className="settings-action-btn" onClick={handleReauth} disabled={isReauthenticating} title="Clear ChatGPT session data and log in again">
+                  {isReauthenticating ? 'Re-authenticating...' : 'Re-authenticate'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {showSearch && (
+        <div className="modal-backdrop" onClick={() => setShowSearch(false)}>
+          <div className="search-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Search Conversations</h2>
+              <button className="close-modal" onClick={() => setShowSearch(false)}>×</button>
+            </div>
+            <div className="search-input-container">
+              <input
+                autoFocus
+                type="text"
+                placeholder="Search all messages..."
+                value={searchQuery}
+                onChange={(e) => handleSearch(e.target.value)}
+              />
+            </div>
+            {trimmedSearchQuery && (
+              <div className="search-results-meta">
+                {searchMatchCount} match{searchMatchCount === 1 ? '' : 'es'}
+              </div>
+            )}
+            <div className="search-results">
+              {searchResults.length === 0 && trimmedSearchQuery !== '' && (
+                <div className="no-results">No messages found matching "{searchQuery}"</div>
+              )}
+              {searchResults.map(res => (
+                <div key={res.id} className="search-result-item" onClick={(e) => jumpToMessage(e, res.conversation_id, res.id)}>
+                  <div className="search-result-header">
+                    <span className="search-result-title">{res.conversation_title}</span>
+                    <span className="search-result-role">{res.role}</span>
+                  </div>
+                  <div className="search-result-content">
+                    {(() => {
+                      const text = res.content;
+                      const idx = text.toLowerCase().indexOf(searchQuery.toLowerCase());
+                      const start = Math.max(0, idx - 60);
+                      const end = Math.min(text.length, idx + 100);
+                      const preview = (start > 0 ? '...' : '') + text.substring(start, end) + (end < text.length ? '...' : '');
+                      const escaped = escapeRegExp(searchQuery);
+                      const parts = preview.split(new RegExp(`(${escaped})`, 'gi'));
+                      return parts.map((part, i) => part.toLowerCase() === searchQuery.toLowerCase() ? <span key={i} className="search-highlight">{part}</span> : part);
+                    })()}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
       {fullscreenImage && (
         <div className="image-lightbox" onClick={() => { setImageMenu(null); setFullscreenImage(null); }}>
           <button className="image-lightbox-close" onClick={() => setFullscreenImage(null)} aria-label="Close image preview">×</button>
