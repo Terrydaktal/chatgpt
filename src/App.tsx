@@ -34,7 +34,37 @@ const HighlightText = ({ children, query }: { children: React.ReactNode, query: 
   });
 };
 
-const MarkdownMessage = memo(({ content, highlightQuery }: { content: string, highlightQuery?: string }) => {
+const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: any) => {
+  const [resolvedSrc, setResolvedSrc] = useState<string | undefined>(src);
+  const [triedFallback, setTriedFallback] = useState(false);
+
+  useEffect(() => {
+    setResolvedSrc(src);
+    setTriedFallback(false);
+  }, [src]);
+
+  const handleError = useCallback(async () => {
+    if (triedFallback || !src || typeof src !== 'string' || !src.startsWith('chatgpt-image://')) return;
+    setTriedFallback(true);
+    const rawId = src.replace('chatgpt-image://', '').replace(/^\/+/, '');
+    try {
+      const dataUrl = await window.electronAPI.invoke('api:getImageDataUrl', { rawImageId: rawId, conversationId });
+      if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
+        setResolvedSrc(dataUrl);
+      }
+    } catch (error) {
+      console.error('Image fallback failed:', error);
+    }
+  }, [src, conversationId, triedFallback]);
+
+  const handleClick = useCallback(() => {
+    if (resolvedSrc && onOpenImage) onOpenImage(resolvedSrc);
+  }, [resolvedSrc, onOpenImage]);
+
+  return <img src={resolvedSrc} alt={alt || 'Image'} loading="lazy" onError={handleError} onClick={handleClick} {...props} />;
+};
+
+const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenImage }: { content: string, highlightQuery?: string, conversationId?: string, onOpenImage?: (src: string) => void }) => {
   const query = highlightQuery || '';
   return (
     <ReactMarkdown
@@ -48,7 +78,7 @@ const MarkdownMessage = memo(({ content, highlightQuery }: { content: string, hi
         h2: ({ children }) => <h2><HighlightText query={query}>{children}</HighlightText></h2>,
         h3: ({ children }) => <h3><HighlightText query={query}>{children}</HighlightText></h3>,
         img: ({ src, alt, ...props }: any) => {
-          return <img src={src} alt={alt || 'Image'} loading="lazy" {...props} />;
+          return <ChatImage src={src} alt={alt} conversationId={conversationId} onOpenImage={onOpenImage} {...props} />;
         },
         code({ inline, className, children, ...props }: any) {
           const match = /language-(\w+)/.exec(className || '');
@@ -76,13 +106,13 @@ const MarkdownMessage = memo(({ content, highlightQuery }: { content: string, hi
   );
 });
 
-const MessageRow = memo(({ msg, highlightQuery, isTarget }: { msg: Message, highlightQuery?: string, isTarget?: boolean }) => {
+const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage }: { msg: Message, highlightQuery?: string, isTarget?: boolean, onOpenImage?: (src: string) => void }) => {
   return (
     <div className={`message-row ${msg.role} ${isTarget ? 'highlight-target' : ''}`}>
       <div className="message-content">
         <div className="role-label">{msg.role === 'user' ? 'You' : 'ChatGPT'}</div>
         <div className="markdown-body">
-          <MarkdownMessage content={msg.content} highlightQuery={isTarget ? highlightQuery : undefined} />
+          <MarkdownMessage content={msg.content} highlightQuery={isTarget ? highlightQuery : undefined} conversationId={msg.conversation_id} onOpenImage={onOpenImage} />
         </div>
       </div>
     </div>
@@ -131,10 +161,13 @@ function App() {
   const [hasMoreConvs, setHasMoreConvs] = useState(true);
   const [isLoadingMoreConvs, setIsLoadingMoreConvs] = useState(false);
   const [cacheStats, setCacheStats] = useState({ localCount: 0, cachedCount: 0 });
+  const [cacheDiagnostics, setCacheDiagnostics] = useState({ uncachedCount: 0, failedCount: 0, unknownCount: 0 });
   const [isCachingAll, setIsCachingAll] = useState(false);
 
   const [isPanning, setIsPanning] = useState(false);
   const [panPosition, setPanPosition] = useState({ x: 0, y: 0 });
+  const [fullscreenImage, setFullscreenImage] = useState<string | null>(null);
+  const [imageMenu, setImageMenu] = useState<{ x: number; y: number } | null>(null);
   const panStart = useRef({ x: 0, y: 0 });
   const panCurrent = useRef({ x: 0, y: 0 });
   const panRaf = useRef<number | null>(null);
@@ -298,12 +331,24 @@ function App() {
     setCacheStats(stats);
   }, []);
 
+  const updateCacheDiagnostics = useCallback(async () => {
+    const diagnostics = await window.electronAPI.invoke('db:getCacheDiagnostics');
+    if (diagnostics) {
+      setCacheDiagnostics({
+        uncachedCount: Number(diagnostics.uncachedCount || 0),
+        failedCount: Number(diagnostics.failedCount || 0),
+        unknownCount: Number(diagnostics.unknownCount || 0),
+      });
+    }
+  }, []);
+
   const handleCacheAll = async () => {
     if (isCachingAll) return;
     setIsCachingAll(true);
     try {
       await window.electronAPI.invoke('api:cacheAll');
       updateStats();
+      updateCacheDiagnostics();
     } catch (e) {
       console.error('Cache All failed', e);
     } finally {
@@ -311,17 +356,33 @@ function App() {
     }
   };
 
+  const handleRetryFailedCache = async () => {
+    if (isCachingAll || cacheDiagnostics.failedCount === 0) return;
+    setIsCachingAll(true);
+    try {
+      await window.electronAPI.invoke('api:cacheFailed');
+      updateStats();
+      updateCacheDiagnostics();
+    } catch (e) {
+      console.error('Retry failed-cache pass failed', e);
+    } finally {
+      setIsCachingAll(false);
+    }
+  };
+
   useEffect(() => {
     updateStats();
-  }, [conversations, updateStats]);
+    updateCacheDiagnostics();
+  }, [conversations, updateStats, updateCacheDiagnostics]);
 
   useEffect(() => {
     if (window.electronAPI.onCacheProgress) {
       window.electronAPI.onCacheProgress(() => {
         updateStats();
+        updateCacheDiagnostics();
       });
     }
-  }, [updateStats]);
+  }, [updateStats, updateCacheDiagnostics]);
 
   useEffect(() => {
     localStorage.setItem('selectedModel', selectedModel);
@@ -422,6 +483,34 @@ function App() {
   }, [isPanning]);
 
   useEffect(() => {
+    if (fullscreenImage) setImageMenu(null);
+  }, [fullscreenImage]);
+
+  useEffect(() => {
+    if (!fullscreenImage) return;
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (imageMenu) setImageMenu(null);
+        else setFullscreenImage(null);
+      }
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, [fullscreenImage, imageMenu]);
+
+  const handleCopyFullscreenImage = useCallback(async () => {
+    if (!fullscreenImage) return;
+    const result = await window.electronAPI.invoke('api:copyImageToClipboard', {
+      src: fullscreenImage,
+      conversationId: activeConvId || undefined,
+    });
+    if (!result?.success) {
+      console.error('Copy image failed:', result?.error || 'unknown error');
+    }
+    setImageMenu(null);
+  }, [fullscreenImage, activeConvId]);
+
+  useEffect(() => {
     const init = async () => {
       await checkAuth();
       const savedId = localStorage.getItem('lastConvId');
@@ -508,19 +597,36 @@ function App() {
         <div className="sidebar-footer">
           <div className="cache-stats-container">
             <div className="cache-stats-text">
-              <span className="stats-label">Cached:</span>
-              <span className="stats-value">{cacheStats.cachedCount} / {cacheStats.localCount}</span>
+              <div className="cache-stats-line">
+                <span className="stats-label">Cached:</span>
+                <span className="stats-value">{cacheStats.cachedCount} / {cacheStats.localCount}</span>
+              </div>
+              <div className="cache-stats-line" title="Uncached chats split by known failed fetches vs unknown/no-data cases">
+                <span className="stats-label">Uncached:</span>
+                <span className="stats-value">{cacheDiagnostics.uncachedCount}</span>
+                <span className="stats-subvalue">fail {cacheDiagnostics.failedCount} · unknown {cacheDiagnostics.unknownCount}</span>
+              </div>
             </div>
-            <button 
-              className={`cache-all-btn ${isCachingAll ? 'spinning' : ''}`} 
-              onClick={handleCacheAll} 
-              disabled={isCachingAll || cacheStats.cachedCount === cacheStats.localCount}
-              title="Cache all missing chats locally"
-            >
-              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
-              </svg>
-            </button>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                className="cache-all-btn"
+                onClick={handleRetryFailedCache}
+                disabled={isCachingAll || cacheDiagnostics.failedCount === 0}
+                title="Retry only conversations with known cache failures"
+              >
+                Retry failed
+              </button>
+              <button 
+                className={`cache-all-btn ${isCachingAll ? 'spinning' : ''}`} 
+                onClick={handleCacheAll} 
+                disabled={isCachingAll || cacheStats.cachedCount === cacheStats.localCount}
+                title="Cache all missing chats locally"
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                  <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+                </svg>
+              </button>
+            </div>
           </div>
           <div className="footer-actions">
             <button className="sync-btn-sidebar" onClick={() => activeConvId && selectConversation(activeConvId, true)} title="Sync current chat">
@@ -540,7 +646,7 @@ function App() {
         {isSyncing && <div className="sync-indicator">Syncing...</div>}
         <div className="messages-container" onMouseDown={startPanning}>
           <Virtuoso ref={virtuosoRef} scrollerRef={(el) => scrollerRef.current = el as HTMLElement} data={messages} initialTopMostItemIndex={messages.length > 0 ? messages.length - 1 : 0} followOutput={targetMessageId ? false : "auto"}
-            itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} highlightQuery={activeHighlightQuery} isTarget={targetMessageId === msg.id} />}
+            itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} highlightQuery={activeHighlightQuery} isTarget={targetMessageId === msg.id} onOpenImage={setFullscreenImage} />}
           />
         </div>
         <div className="input-area">
@@ -560,6 +666,31 @@ function App() {
       {showSettings && <div className="modal-backdrop" onClick={() => setShowSettings(false)}><div className="settings-modal" onClick={e => e.stopPropagation()}><div className="modal-header"><h2>Settings</h2><button className="close-modal" onClick={() => setShowSettings(false)}>×</button></div><div className="setting-item"><label>Font Size <span className="setting-value">{fontSize}pt</span></label><input type="range" min="8" max="20" value={fontSize} onChange={(e) => setFontSize(parseInt(e.target.value))} /></div><div className="setting-item"><label>Chat Column Width <span className="setting-value">{chatWidth}px</span></label><input type="range" min="400" max="5000" step="50" value={chatWidth} onChange={(e) => setChatWidth(parseInt(e.target.value))} /></div></div></div>}
       {showSearch && <div className="modal-backdrop" onClick={() => setShowSearch(false)}><div className="search-modal" onClick={e => e.stopPropagation()}><div className="modal-header"><h2>Search Conversations</h2><button className="close-modal" onClick={() => setShowSearch(false)}>×</button></div><div className="search-input-container"><input autoFocus type="text" placeholder="Search all messages..." value={searchQuery} onChange={(e) => handleSearch(e.target.value)} /></div><div className="search-results">{searchResults.length === 0 && searchQuery.trim() !== '' && <div className="no-results">No messages found matching "{searchQuery}"</div>}{searchResults.map(res => (
         <div key={res.id} className="search-result-item" onClick={(e) => jumpToMessage(e, res.conversation_id, res.id)}><div className="search-result-header"><span className="search-result-title">{res.conversation_title}</span><span className="search-result-role">{res.role}</span></div><div className="search-result-content">{(() => { const text = res.content; const idx = text.toLowerCase().indexOf(searchQuery.toLowerCase()); const start = Math.max(0, idx - 60); const end = Math.min(text.length, idx + 100); const preview = (start > 0 ? '...' : '') + text.substring(start, end) + (end < text.length ? '...' : ''); const escaped = escapeRegExp(searchQuery); const parts = preview.split(new RegExp(`(${escaped})`, 'gi')); return parts.map((part, i) => part.toLowerCase() === searchQuery.toLowerCase() ? <span key={i} className="search-highlight">{part}</span> : part); })()}</div></div>))}</div></div></div>}
+      {fullscreenImage && (
+        <div className="image-lightbox" onClick={() => { setImageMenu(null); setFullscreenImage(null); }}>
+          <button className="image-lightbox-close" onClick={() => setFullscreenImage(null)} aria-label="Close image preview">×</button>
+          <img
+            className="image-lightbox-content"
+            src={fullscreenImage}
+            alt="Full size chat image"
+            onClick={(e) => { e.stopPropagation(); setImageMenu(null); }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setImageMenu({ x: e.clientX, y: e.clientY });
+            }}
+          />
+          {imageMenu && (
+            <div
+              className="image-context-menu"
+              style={{ left: imageMenu.x, top: imageMenu.y }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button className="image-context-menu-item" onClick={handleCopyFullscreenImage}>Copy image</button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -3,6 +3,7 @@ export interface Conversation {
   title: string;
   created_at: number;
   updated_at: number;
+  is_deleted_on_web?: number;
 }
 
 export interface Message {
@@ -16,6 +17,7 @@ export interface Message {
 
 export interface ElectronAPI {
   invoke: (channel: string, ...args: any[]) => Promise<any>;
+  onCacheProgress?: (func: (...args: any[]) => void) => void;
 }
 
 declare global {

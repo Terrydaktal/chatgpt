@@ -36,3 +36,8 @@ out/
 
 # Vite
 src/vite-env.d.ts
+
+# Local Codex metadata
+.codex/
+
+.codex

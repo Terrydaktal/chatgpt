@@ -78,13 +78,21 @@ class ChatGPTAuth {
     const token = await this.getAccessToken();
     if (!token) throw new Error('Not authenticated');
 
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      ...options.headers,
+    };
+
+    const hasContentType = Object.keys(headers).some(
+      key => key.toLowerCase() === 'content-type'
+    );
+    if (options.body && !hasContentType) {
+      headers['Content-Type'] = 'application/json';
+    }
+
     const response = await session.defaultSession.fetch(url, {
       ...options,
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
+      headers,
     });
 
     return response;
