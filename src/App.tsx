@@ -2,14 +2,43 @@ import React, { useState, useEffect, useRef, memo, useCallback } from 'react';
 import type { Conversation, Message } from './types';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import 'katex/dist/katex.min.css';
 import './index.css';
 
 const escapeRegExp = (string: string) => {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
+
+const getMessagePreview = (content: string) => {
+  const normalized = content
+    .replace(/!\[[^\]]*]\([^)]+\)/g, ' [image] ')
+    .replace(/```[\s\S]*?```/g, ' [code] ')
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized) return '[empty]';
+  return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+};
+
+const normalizeMathDelimiters = (content: string) => {
+  const segments = content.split(/(```[\s\S]*?```)/g);
+  return segments
+    .map((segment) => {
+      if (segment.startsWith('```')) return segment;
+      return segment
+        .replace(/\\\[(.*?)\\\]/gs, (_match, expr: string) => `\n$$\n${expr.trim()}\n$$\n`)
+        .replace(/\\\((.*?)\\\)/gs, (_match, expr: string) => `$${expr.trim()}$`);
+    })
+    .join('');
+};
+
+const isNavigableMessage = (msg: Message) =>
+  (msg.role === 'user' || msg.role === 'assistant') && !!msg.content?.trim();
 
 const HighlightText = ({ children, query }: { children: React.ReactNode, query: string }): any => {
   if (!query || !query.trim()) return children;
@@ -66,17 +95,18 @@ const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: any) => 
 
 const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenImage }: { content: string, highlightQuery?: string, conversationId?: string, onOpenImage?: (src: string) => void }) => {
   const query = highlightQuery || '';
+  const renderedContent = normalizeMathDelimiters(content);
   return (
     <ReactMarkdown
       urlTransform={(value: string) => value}
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
       components={{
-        p: ({ children }) => <p><HighlightText query={query}>{children}</HighlightText></p>,
-        li: ({ children }) => <li><HighlightText query={query}>{children}</HighlightText></li>,
-        span: ({ children }) => <span><HighlightText query={query}>{children}</HighlightText></span>,
-        h1: ({ children }) => <h1><HighlightText query={query}>{children}</HighlightText></h1>,
-        h2: ({ children }) => <h2><HighlightText query={query}>{children}</HighlightText></h2>,
-        h3: ({ children }) => <h3><HighlightText query={query}>{children}</HighlightText></h3>,
+        p: ({ children, ...props }) => <p {...props}><HighlightText query={query}>{children}</HighlightText></p>,
+        li: ({ children, ...props }) => <li {...props}><HighlightText query={query}>{children}</HighlightText></li>,
+        h1: ({ children, ...props }) => <h1 {...props}><HighlightText query={query}>{children}</HighlightText></h1>,
+        h2: ({ children, ...props }) => <h2 {...props}><HighlightText query={query}>{children}</HighlightText></h2>,
+        h3: ({ children, ...props }) => <h3 {...props}><HighlightText query={query}>{children}</HighlightText></h3>,
         img: ({ src, alt, ...props }: any) => {
           return <ChatImage src={src} alt={alt} conversationId={conversationId} onOpenImage={onOpenImage} {...props} />;
         },
@@ -101,14 +131,14 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
         },
       }}
     >
-      {content}
+      {renderedContent}
     </ReactMarkdown>
   );
 });
 
 const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage }: { msg: Message, highlightQuery?: string, isTarget?: boolean, onOpenImage?: (src: string) => void }) => {
   return (
-    <div className={`message-row ${msg.role} ${isTarget ? 'highlight-target' : ''}`}>
+    <div className={`message-row ${msg.role} ${isTarget ? 'highlight-target' : ''}`} data-message-id={msg.id}>
       <div className="message-content">
         <div className="role-label">{msg.role === 'user' ? 'You' : 'ChatGPT'}</div>
         <div className="markdown-body">
@@ -157,6 +187,9 @@ function App() {
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [targetMessageId, setTargetMessageId] = useState<string | null>(null);
   const [activeHighlightQuery, setActiveHighlightQuery] = useState('');
+  const [isMessageMapOpen, setIsMessageMapOpen] = useState<boolean>(() => localStorage.getItem('messageMapOpen') !== '0');
+  const [viewportNavMessageId, setViewportNavMessageId] = useState<string | null>(null);
+  const [messageScrollerEl, setMessageScrollerEl] = useState<HTMLElement | null>(null);
 
   const [hasMoreConvs, setHasMoreConvs] = useState(true);
   const [isLoadingMoreConvs, setIsLoadingMoreConvs] = useState(false);
@@ -171,12 +204,22 @@ function App() {
   const panStart = useRef({ x: 0, y: 0 });
   const panCurrent = useRef({ x: 0, y: 0 });
   const panRaf = useRef<number | null>(null);
+  const panScrollTargetRef = useRef<HTMLElement | null>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const activeConvIdRef = useRef<string | null>(localStorage.getItem('lastConvId'));
   const hasScrolledToBottomRef = useRef<Record<string, boolean>>({});
+  const virtuosoStateByConversationRef = useRef<Record<string, any>>({});
+  const [restoreVirtuosoState, setRestoreVirtuosoState] = useState<any | null>(null);
+
+  const saveVirtuosoState = useCallback((conversationId: string | null) => {
+    if (!conversationId || !virtuosoRef.current?.getState) return;
+    virtuosoRef.current.getState((state: any) => {
+      virtuosoStateByConversationRef.current[conversationId] = state;
+    });
+  }, []);
 
   const loadConversations = useCallback(async () => {
     const localConvs = await window.electronAPI.invoke('db:getConversations');
@@ -223,12 +266,22 @@ function App() {
     }
   }, [conversations.length, hasMoreConvs, isLoadingMoreConvs]);
 
-  const selectConversation = useCallback(async (id: string, forceSync = false) => {
+  const selectConversation = useCallback(async (id: string, forceSync = false, shouldSync = false) => {
     if (id === activeConvIdRef.current && !forceSync) return;
+
+    if (activeConvIdRef.current && activeConvIdRef.current !== id) {
+      saveVirtuosoState(activeConvIdRef.current);
+    }
+
+    setRestoreVirtuosoState(virtuosoStateByConversationRef.current[id] || null);
     setActiveConvId(id);
     activeConvIdRef.current = id;
     const localMsgs = await window.electronAPI.invoke('db:getMessages', id);
     setMessages(localMsgs);
+    if (!shouldSync) {
+      setIsSyncing(false);
+      return;
+    }
     setIsSyncing(true);
     window.electronAPI.invoke('api:syncMessages', id)
       .then((syncedMsgs: Message[]) => {
@@ -243,7 +296,7 @@ function App() {
       .finally(() => {
         if (activeConvIdRef.current === id) setIsSyncing(false);
       });
-  }, []);
+  }, [saveVirtuosoState]);
 
   const handleSend = async () => {
     if (!inputValue.trim() && !pastedImage) return;
@@ -298,6 +351,11 @@ function App() {
     selectConversation(convId);
     setShowSearch(false);
   };
+
+  const jumpToMessageInCurrentChat = useCallback((msgId: string) => {
+    setTargetMessageId(msgId);
+    setActiveHighlightQuery('');
+  }, []);
 
   const handleDeleteConversation = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
@@ -394,12 +452,12 @@ function App() {
         const index = messages.findIndex(m => m.id === targetMessageId);
         if (index !== -1) {
           const timer = setTimeout(() => {
-            virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'auto' });
+            virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' });
             hasScrolledToBottomRef.current[activeConvId] = true;
           }, 150);
           return () => clearTimeout(timer);
         }
-      } else if (!hasScrolledToBottomRef.current[activeConvId]) {
+      } else if (!hasScrolledToBottomRef.current[activeConvId] && !virtuosoStateByConversationRef.current[activeConvId]) {
         const timer = setTimeout(() => {
           virtuosoRef.current?.scrollToIndex({ index: messages.length - 1, align: 'end', behavior: 'auto' });
           hasScrolledToBottomRef.current[activeConvId] = true;
@@ -439,6 +497,10 @@ function App() {
   }, [chatWidth]);
 
   useEffect(() => {
+    localStorage.setItem('messageMapOpen', isMessageMapOpen ? '1' : '0');
+  }, [isMessageMapOpen]);
+
+  useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
@@ -458,6 +520,7 @@ function App() {
   useEffect(() => {
     if (!isPanning) {
       if (panRaf.current) cancelAnimationFrame(panRaf.current);
+      panScrollTargetRef.current = null;
       return;
     }
     const handleMouseMove = (e: MouseEvent) => { panCurrent.current = { x: e.clientX, y: e.clientY }; };
@@ -465,11 +528,11 @@ function App() {
     window.addEventListener('mousemove', handleMouseMove, { passive: true });
     window.addEventListener('mouseup', handleMouseUp, { passive: true });
     const scrollLoop = () => {
-      if (scrollerRef.current) {
+      if (panScrollTargetRef.current) {
         const dy = panCurrent.current.y - panStart.current.y;
         if (Math.abs(dy) > 5) {
           const speed = (dy - Math.sign(dy) * 5) * 0.15;
-          scrollerRef.current.scrollBy(0, speed);
+          panScrollTargetRef.current.scrollBy(0, speed);
         }
       }
       panRaf.current = requestAnimationFrame(scrollLoop);
@@ -485,6 +548,10 @@ function App() {
   useEffect(() => {
     if (fullscreenImage) setImageMenu(null);
   }, [fullscreenImage]);
+
+  useEffect(() => {
+    setViewportNavMessageId(null);
+  }, [activeConvId]);
 
   useEffect(() => {
     if (!fullscreenImage) return;
@@ -514,7 +581,7 @@ function App() {
     const init = async () => {
       await checkAuth();
       const savedId = localStorage.getItem('lastConvId');
-      if (savedId) { selectConversation(savedId, true); }
+      if (savedId) { selectConversation(savedId, true, true); }
     };
     init();
     const handleGlobalPaste = (e: ClipboardEvent) => {
@@ -545,15 +612,89 @@ function App() {
     };
   }, [showModelMenu, checkAuth, selectConversation]);
 
-  const startPanning = (e: React.MouseEvent) => {
+  const startPanning = (e: React.MouseEvent, scrollTarget?: HTMLElement | null) => {
     if (e.button === 1) {
       e.preventDefault();
       setIsPanning(true);
+      panScrollTargetRef.current = scrollTarget || scrollerRef.current;
       setPanPosition({ x: e.clientX, y: e.clientY });
       panStart.current = { x: e.clientX, y: e.clientY };
       panCurrent.current = { x: e.clientX, y: e.clientY };
     }
   };
+
+  const updateViewportNavHighlight = useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const scrollerRect = scroller.getBoundingClientRect();
+    const viewportTop = scrollerRect.top;
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>('.message-row[data-message-id]'));
+    const navigableIds = new Set(messages.filter(isNavigableMessage).map((m) => m.id));
+    let nextId: string | null = null;
+
+    for (const row of rows) {
+      const msgId = row.dataset.messageId || null;
+      if (!msgId || !navigableIds.has(msgId)) continue;
+      const rect = row.getBoundingClientRect();
+      if (rect.top <= viewportTop && rect.bottom > viewportTop) {
+        nextId = msgId;
+        break;
+      }
+    }
+
+    if (!nextId) {
+      for (const row of rows) {
+        const msgId = row.dataset.messageId || null;
+        if (!msgId || !navigableIds.has(msgId)) continue;
+        const top = row.getBoundingClientRect().top;
+        if (top >= scrollerRect.top) {
+          nextId = msgId;
+          break;
+        }
+      }
+    }
+
+    if (!nextId) {
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        const msgId = row.dataset.messageId || null;
+        if (!msgId || !navigableIds.has(msgId)) continue;
+        nextId = msgId;
+        break;
+      }
+    }
+
+    setViewportNavMessageId((prev) => (prev === nextId ? prev : nextId));
+  }, [messages]);
+
+  const handleMessageRangeChanged = useCallback(() => {
+    updateViewportNavHighlight();
+  }, [updateViewportNavHighlight]);
+
+  useEffect(() => {
+    if (!messageScrollerEl) return;
+    let rafId: number | null = null;
+    const scheduleHighlightUpdate = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        updateViewportNavHighlight();
+      });
+    };
+    messageScrollerEl.addEventListener('scroll', scheduleHighlightUpdate, { passive: true });
+    window.addEventListener('resize', scheduleHighlightUpdate, { passive: true });
+    scheduleHighlightUpdate();
+    return () => {
+      messageScrollerEl.removeEventListener('scroll', scheduleHighlightUpdate);
+      window.removeEventListener('resize', scheduleHighlightUpdate);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [messageScrollerEl, updateViewportNavHighlight]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => updateViewportNavHighlight(), 0);
+    return () => window.clearTimeout(timer);
+  }, [messages, updateViewportNavHighlight]);
 
   if (isAuth === null) return <div className="auth-overlay">Loading...</div>;
   if (isAuth === false) return (
@@ -563,6 +704,11 @@ function App() {
       <button className="login-btn" onClick={handleLogin}>Login with Browser</button>
     </div>
   );
+
+  const navigationMessages = messages
+    .filter(isNavigableMessage)
+    .map((m, i) => ({ ...m, navIndex: i + 1, preview: getMessagePreview(m.content) }));
+  const activeMapMessageId = isMessageMapOpen ? viewportNavMessageId : targetMessageId;
 
   return (
     <div className="app-container">
@@ -574,7 +720,7 @@ function App() {
       <div className="sidebar">
         <div className="sidebar-header">
           <div style={{ display: 'flex', gap: '8px' }}>
-            <button className="new-chat-btn" onClick={() => { setActiveConvId(null); setMessages([]); activeConvIdRef.current = null; }}>+ New Chat</button>
+            <button className="new-chat-btn" onClick={() => { saveVirtuosoState(activeConvIdRef.current); setActiveConvId(null); setMessages([]); activeConvIdRef.current = null; setRestoreVirtuosoState(null); }}>+ New Chat</button>
             <button className="search-trigger-btn" onClick={() => setShowSearch(true)} title="Search Chats">
               <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
             </button>
@@ -629,7 +775,7 @@ function App() {
             </div>
           </div>
           <div className="footer-actions">
-            <button className="sync-btn-sidebar" onClick={() => activeConvId && selectConversation(activeConvId, true)} title="Sync current chat">
+            <button className="sync-btn-sidebar" onClick={() => activeConvId && selectConversation(activeConvId, true, true)} title="Sync current chat">
               <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
             </button>
             <button className="sync-btn-sidebar" onClick={handleAudit} title="Audit Web Deletions (Check for missing chats)">
@@ -643,11 +789,41 @@ function App() {
         </div>
       </div>
       <div className="main-content">
-        {isSyncing && <div className="sync-indicator">Syncing...</div>}
-        <div className="messages-container" onMouseDown={startPanning}>
-          <Virtuoso ref={virtuosoRef} scrollerRef={(el) => scrollerRef.current = el as HTMLElement} data={messages} initialTopMostItemIndex={messages.length > 0 ? messages.length - 1 : 0} followOutput={targetMessageId ? false : "auto"}
-            itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} highlightQuery={activeHighlightQuery} isTarget={targetMessageId === msg.id} onOpenImage={setFullscreenImage} />}
-          />
+        <div className="chat-body">
+          <div className="chat-pane">
+            {isSyncing && <div className="sync-indicator">Syncing...</div>}
+            <div className="messages-container" onMouseDown={(e) => startPanning(e, scrollerRef.current)}>
+              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={(el) => { scrollerRef.current = el as HTMLElement; setMessageScrollerEl((el as HTMLElement) || null); }} data={messages} initialTopMostItemIndex={messages.length > 0 ? messages.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} rangeChanged={handleMessageRangeChanged}
+                itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} highlightQuery={activeHighlightQuery} isTarget={targetMessageId === msg.id} onOpenImage={setFullscreenImage} />}
+              />
+            </div>
+          </div>
+          <button
+            className={`content-nav-toggle ${isMessageMapOpen ? 'open' : 'closed'}`}
+            onClick={() => setIsMessageMapOpen((prev) => !prev)}
+            title={isMessageMapOpen ? 'Hide message map' : 'Show message map'}
+            aria-label={isMessageMapOpen ? 'Hide message map' : 'Show message map'}
+          >
+            {isMessageMapOpen ? '›' : '‹'}
+          </button>
+          <aside className={`content-nav ${isMessageMapOpen ? '' : 'collapsed'}`} aria-label="Chat message navigation">
+            <div className="content-nav-header">
+              <span>Message Map</span>
+            </div>
+            <div className="content-nav-list" onMouseDown={(e) => startPanning(e, e.currentTarget as HTMLElement)}>
+              {navigationMessages.map((msg) => (
+                <button
+                  key={msg.id}
+                  className={`content-nav-item ${msg.role === 'user' ? 'role-user' : 'role-assistant'} ${activeMapMessageId === msg.id ? 'active' : ''}`}
+                  onClick={() => jumpToMessageInCurrentChat(msg.id)}
+                  title={msg.preview}
+                >
+                  <span className="content-nav-index">{msg.navIndex}</span>
+                  <span className="content-nav-text">{msg.preview}</span>
+                </button>
+              ))}
+            </div>
+          </aside>
         </div>
         <div className="input-area">
           <div className="input-container">
