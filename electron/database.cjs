@@ -16,7 +16,8 @@ class ChatDatabase {
         title TEXT,
         created_at DATETIME,
         updated_at DATETIME,
-        current_node_id TEXT
+        current_node_id TEXT,
+        is_deleted_on_web INTEGER DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS messages (
@@ -32,11 +33,17 @@ class ChatDatabase {
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
     `);
 
-    // Migration: Add current_node_id if it doesn't exist (for existing databases)
+    // Migrations
     const tableInfo = this.db.prepare("PRAGMA table_info(conversations)").all();
+    
     const hasCurrentNode = tableInfo.some(col => col.name === 'current_node_id');
     if (!hasCurrentNode) {
       this.db.exec("ALTER TABLE conversations ADD COLUMN current_node_id TEXT");
+    }
+
+    const hasDeletedOnWeb = tableInfo.some(col => col.name === 'is_deleted_on_web');
+    if (!hasDeletedOnWeb) {
+      this.db.exec("ALTER TABLE conversations ADD COLUMN is_deleted_on_web INTEGER DEFAULT 0");
     }
   }
 
@@ -69,14 +76,29 @@ class ChatDatabase {
 
   upsertConversation(conv) {
     const stmt = this.db.prepare(`
-      INSERT INTO conversations (id, title, created_at, updated_at, current_node_id)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO conversations (id, title, created_at, updated_at, current_node_id, is_deleted_on_web)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         title = excluded.title,
         updated_at = excluded.updated_at,
-        current_node_id = excluded.current_node_id
+        current_node_id = excluded.current_node_id,
+        is_deleted_on_web = excluded.is_deleted_on_web
     `);
-    stmt.run(conv.id, conv.title, conv.created_at, conv.updated_at, conv.current_node_id);
+    stmt.run(conv.id, conv.title, conv.created_at, conv.updated_at, conv.current_node_id, conv.is_deleted_on_web || 0);
+  }
+
+  markAsDeletedOnWeb(id) {
+    this.db.prepare('UPDATE conversations SET is_deleted_on_web = 1 WHERE id = ?').run(id);
+  }
+
+  deleteConversation(id) {
+    const deleteMsgs = this.db.prepare('DELETE FROM messages WHERE conversation_id = ?');
+    const deleteConv = this.db.prepare('DELETE FROM conversations WHERE id = ?');
+    
+    this.db.transaction(() => {
+      deleteMsgs.run(id);
+      deleteConv.run(id);
+    })();
   }
 
   upsertMessage(msg) {
@@ -87,6 +109,17 @@ class ChatDatabase {
         content = excluded.content
     `);
     stmt.run(msg.id, msg.conversation_id, msg.role, msg.content, msg.created_at, msg.parent_id);
+  }
+
+  searchMessages(query) {
+    return this.db.prepare(`
+      SELECT m.*, c.title as conversation_title
+      FROM messages m
+      JOIN conversations c ON m.conversation_id = c.id
+      WHERE m.content LIKE ?
+      ORDER BY m.created_at DESC
+      LIMIT 100
+    `).all(`%${query}%`);
   }
 }
 
