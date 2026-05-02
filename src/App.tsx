@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, memo, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, memo, useCallback, useMemo, useDeferredValue } from 'react';
 import type { Conversation, Message } from './types';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -10,10 +10,31 @@ import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import 'katex/dist/katex.min.css';
 import './index.css';
 
-const escapeRegExp = (string: string) => {
+const escapeRegExp = (value: unknown) => {
+  const string = typeof value === 'string' ? value : String(value ?? '');
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const MAX_HIGHLIGHT_TEXT_LEN = 20000;
+const MAX_HIGHLIGHT_MATCHES = 160;
+const MAX_HIGHLIGHT_NODE_TEXT_LEN = 60000;
+const MAX_MESSAGE_HIGHLIGHT_HITS = 240;
+const MAX_MAP_SEARCH_QUERY_LEN = 160;
+const MAX_MARKDOWN_RENDER_CHARS = 30000;
+const MAX_MARKDOWN_RENDER_LINES = 1200;
+const MAX_MARKDOWN_MATH_DELIMITERS = 180;
+const MAX_MARKDOWN_LATEX_COMMANDS = 320;
+const MAX_MARKDOWN_CDOT_COMMANDS = 80;
+const MIN_PLAIN_LATEX_COMMANDS = 6;
+const MIN_PLAIN_LATEX_LINES = 8;
+const MAX_CODE_HIGHLIGHT_CHARS = 8000;
+const MAX_CODE_HIGHLIGHT_LINES = 400;
+const MAX_SAFE_FALLBACK_CHARS = 120000;
+const FONT_SIZE_MIN = 8;
+const FONT_SIZE_MAX = 20;
+const FONT_SIZE_DEFAULT = 12;
+const clampFontSize = (value: number) =>
+  Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, Math.round(value)));
 
 const getMessagePreview = (content: string) => {
   const normalized = content
@@ -93,11 +114,16 @@ const normalizeProductsMarkers = (content: string) => {
   });
 };
 
-const isNavigableMessage = (msg: Message) =>
-  (msg.role === 'user' || msg.role === 'assistant') && !!msg.content?.trim();
-
 type ThinkingPart = Pick<Message, 'id' | 'role' | 'content'>;
-type DisplayMessage = Message & { thinkingParts?: ThinkingPart[] };
+type DisplayMessage = Message & {
+  thinkingParts?: ThinkingPart[];
+  isBridgeStatus?: boolean;
+  bridgeStatusState?: string;
+};
+const isNavigableMessage = (msg: Message | DisplayMessage) => {
+  if ('isBridgeStatus' in msg && msg.isBridgeStatus) return false;
+  return (msg.role === 'user' || msg.role === 'assistant') && !!msg.content?.trim();
+};
 type CitationEntry = { id: string; url?: string; title?: string };
 type BridgeComposerStatus = {
   conversationId: string | null;
@@ -106,6 +132,48 @@ type BridgeComposerStatus = {
   reason?: string;
   updatedAt?: number;
 };
+
+type OomDebugEntry = {
+  ts: number;
+  event: string;
+  payload?: Record<string, unknown>;
+};
+
+class MarkdownErrorBoundary extends React.Component<
+  { children: React.ReactNode; rawContent: string; conversationId?: string },
+  { hasError: boolean; message: string }
+> {
+  constructor(props: { children: React.ReactNode; rawContent: string; conversationId?: string }) {
+    super(props);
+    this.state = { hasError: false, message: '' };
+  }
+
+  static getDerivedStateFromError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error || 'Unknown markdown render error');
+    return { hasError: true, message };
+  }
+
+  componentDidCatch(error: unknown, info: React.ErrorInfo) {
+    console.error('Markdown render failed:', {
+      conversationId: this.props.conversationId || null,
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      componentStack: info?.componentStack,
+    });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="markdown-fallback">
+          <div className="markdown-fallback-title">Rendering failed for this message.</div>
+          <pre>{this.props.rawContent || ''}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const formatSendError = (error: unknown) => {
   const message = typeof error === 'string'
@@ -386,26 +454,87 @@ const buildDisplayMessages = (rawMessages: Message[]): DisplayMessage[] => {
 };
 
 const HighlightText = ({ children, query }: { children: React.ReactNode, query: string }): any => {
-  if (!query || !query.trim()) return children;
-  const escapedQuery = escapeRegExp(query.trim());
-  const regex = new RegExp(`(${escapedQuery})`, 'gi');
+  const q = typeof query === 'string' ? query.trim() : '';
+  if (!q) return children;
+  const needleLower = q.toLowerCase();
+  if (needleLower.length < 2 || needleLower.length > 80) return children;
   
   return React.Children.map(children, child => {
     if (typeof child === 'string') {
-      const parts = child.split(regex);
-      return parts.map((part, i) => 
-        part.toLowerCase() === query.trim().toLowerCase() 
-          ? <mark key={i} className="chat-highlight">{part}</mark> 
-          : part
-      );
+      if (!child || child.length > MAX_HIGHLIGHT_TEXT_LEN) return child;
+      const haystackLower = child.toLowerCase();
+      if (!haystackLower.includes(needleLower)) return child;
+
+      const output: React.ReactNode[] = [];
+      let cursor = 0;
+      let matchCount = 0;
+      while (cursor < child.length && matchCount < MAX_HIGHLIGHT_MATCHES) {
+        const idx = haystackLower.indexOf(needleLower, cursor);
+        if (idx === -1) break;
+        if (idx > cursor) output.push(child.slice(cursor, idx));
+        output.push(
+          <mark key={`hl-${idx}-${matchCount}`} className="chat-highlight">
+            {child.slice(idx, idx + q.length)}
+          </mark>
+        );
+        cursor = idx + q.length;
+        matchCount++;
+      }
+      if (cursor < child.length) output.push(child.slice(cursor));
+      return output;
     }
     if (React.isValidElement(child) && (child.props as any).children) {
+      const childProps = (child.props as any) || {};
+      const className = typeof childProps.className === 'string' ? childProps.className : '';
+      // KaTeX/math trees are very deep; cloning them recursively for search highlights
+      // can cause large transient allocations in long chats.
+      if (
+        className.includes('katex') ||
+        className.includes('math') ||
+        child.type === 'code' ||
+        child.type === 'pre'
+      ) {
+        return child;
+      }
+      const childText = typeof childProps.children === 'string' ? childProps.children : null;
+      if (childText && childText.length > MAX_HIGHLIGHT_NODE_TEXT_LEN) return child;
       return React.cloneElement(child, {
         children: <HighlightText query={query}>{(child.props as any).children}</HighlightText>
       } as any);
     }
     return child;
   });
+};
+
+const countNeedleHits = (text: string, needleLower: string) => {
+  if (!text || !needleLower) return 0;
+  let cursor = 0;
+  let hits = 0;
+  const haystack = text.toLowerCase();
+  while (cursor < haystack.length) {
+    const idx = haystack.indexOf(needleLower, cursor);
+    if (idx === -1) break;
+    hits++;
+    if (hits > MAX_MESSAGE_HIGHLIGHT_HITS) return hits;
+    cursor = idx + needleLower.length;
+  }
+  return hits;
+};
+
+const sanitizeMapSearchQuery = (raw: string) => {
+  const value = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!value) return '';
+  return value.slice(0, MAX_MAP_SEARCH_QUERY_LEN);
+};
+
+const countLines = (text: string) => {
+  if (!text) return 0;
+  return 1 + (text.match(/\n/g)?.length || 0);
+};
+
+const countRegexMatches = (text: string, pattern: RegExp) => {
+  const matches = text.match(pattern);
+  return matches ? matches.length : 0;
 };
 
 const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: any) => {
@@ -440,69 +569,125 @@ const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: any) => 
 
 const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenImage, citationRegistry }: { content: string, highlightQuery?: string, conversationId?: string, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
   const query = highlightQuery || '';
-  const renderedContent = normalizeMathDelimiters(normalizeCitationMarkers(normalizeProductsMarkers(content)));
+  const rawContent = typeof content === 'string' ? content : String(content || '');
+  const rawLineCount = useMemo(() => countLines(rawContent), [rawContent]);
+  const mathDelimiterCount = useMemo(() => countRegexMatches(rawContent, /\$\$?|\\\(|\\\)|\\\[|\\\]/g), [rawContent]);
+  const latexCommandCount = useMemo(() => countRegexMatches(rawContent, /\\[a-zA-Z]+/g), [rawContent]);
+  const cdotCount = useMemo(() => countRegexMatches(rawContent, /\\cdot\b/g), [rawContent]);
+  const hasMarkdownMath = mathDelimiterCount > 0;
+  const mathComplexityHigh = hasMarkdownMath && (
+    mathDelimiterCount > MAX_MARKDOWN_MATH_DELIMITERS
+    || latexCommandCount > MAX_MARKDOWN_LATEX_COMMANDS
+    || cdotCount > MAX_MARKDOWN_CDOT_COMMANDS
+  );
+  const plainLatexTextMode = !hasMarkdownMath
+    && (latexCommandCount >= MIN_PLAIN_LATEX_COMMANDS || cdotCount > 0)
+    && (rawLineCount >= MIN_PLAIN_LATEX_LINES || rawContent.length > 800);
+  const safeRenderMode = rawContent.length > MAX_MARKDOWN_RENDER_CHARS || rawLineCount > MAX_MARKDOWN_RENDER_LINES;
+  const effectiveQuery = mathComplexityHigh ? '' : query;
+  const safeFallbackContent = useMemo(() => {
+    if (rawContent.length <= MAX_SAFE_FALLBACK_CHARS) return rawContent;
+    return `${rawContent.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`;
+  }, [rawContent]);
+  const renderedContent = useMemo(() => {
+    try {
+      return normalizeMathDelimiters(normalizeCitationMarkers(normalizeProductsMarkers(rawContent)));
+    } catch (error) {
+      console.error('Markdown preprocessing failed:', error);
+      return rawContent;
+    }
+  }, [rawContent]);
+
+  if (safeRenderMode) {
+    return (
+      <div className="markdown-fallback">
+        <div className="markdown-fallback-title">Large message rendered in safe mode.</div>
+        <pre><HighlightText query={effectiveQuery}>{safeFallbackContent}</HighlightText></pre>
+      </div>
+    );
+  }
+
+  if (plainLatexTextMode) {
+    return (
+      <div className="plain-latex-text">
+        <HighlightText query={query}>{rawContent}</HighlightText>
+      </div>
+    );
+  }
+
   return (
-    <ReactMarkdown
-      urlTransform={(value: string) => value}
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeKatex]}
-      components={{
-        a: ({ href, children, ...props }) => {
-          if (typeof href === 'string' && href.startsWith('productref://')) {
-            const id = decodeURIComponent(href.replace('productref://', ''));
-            const entry = citationRegistry[id];
-            if (entry?.url) {
-              return <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id} {...props}>{children}</a>;
+    <MarkdownErrorBoundary rawContent={content} conversationId={conversationId}>
+      <ReactMarkdown
+        urlTransform={(value: string) => value}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
+        components={{
+          a: ({ href, children, ...props }) => {
+            if (typeof href === 'string' && href.startsWith('productref://')) {
+              const id = decodeURIComponent(href.replace('productref://', ''));
+              const entry = citationRegistry[id];
+              if (entry?.url) {
+                return <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id} {...props}>{children}</a>;
+              }
+              return <span title={id}>{children}</span>;
             }
-            return <span title={id}>{children}</span>;
-          }
-          if (typeof href === 'string' && href.startsWith('citation://')) {
-            const id = decodeURIComponent(href.replace('citation://', ''));
-            const entry = citationRegistry[id];
-            if (entry?.url) {
-              return (
-                <sup className="citation-ref">
-                  <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id}>
-                    {children}
-                  </a>
-                </sup>
-              );
+            if (typeof href === 'string' && href.startsWith('citation://')) {
+              const id = decodeURIComponent(href.replace('citation://', ''));
+              const entry = citationRegistry[id];
+              if (entry?.url) {
+                return (
+                  <sup className="citation-ref">
+                    <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id}>
+                      {children}
+                    </a>
+                  </sup>
+                );
+              }
+              return <sup className="citation-ref" title={id}>{children}</sup>;
             }
-            return <sup className="citation-ref" title={id}>{children}</sup>;
-          }
-          return <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>;
-        },
-        p: ({ children, ...props }) => <p {...props}><HighlightText query={query}>{children}</HighlightText></p>,
-        li: ({ children, ...props }) => <li {...props}><HighlightText query={query}>{children}</HighlightText></li>,
-        h1: ({ children, ...props }) => <h1 {...props}><HighlightText query={query}>{children}</HighlightText></h1>,
-        h2: ({ children, ...props }) => <h2 {...props}><HighlightText query={query}>{children}</HighlightText></h2>,
-        h3: ({ children, ...props }) => <h3 {...props}><HighlightText query={query}>{children}</HighlightText></h3>,
-        img: ({ src, alt, ...props }: any) => {
-          return <ChatImage src={src} alt={alt} conversationId={conversationId} onOpenImage={onOpenImage} {...props} />;
-        },
-        code({ inline, className, children, ...props }: any) {
-          const match = /language-(\w+)/.exec(className || '');
-          return !inline && match ? (
-            <SyntaxHighlighter
-              style={vscDarkPlus as any}
-              language={match[1]}
-              PreTag="div"
-              codeTagProps={{ style: { fontSize: 'inherit' } }}
-              customStyle={{ margin: 0, padding: 0, background: 'transparent', fontSize: 'inherit' }}
-              {...props}
-            >
-              {String(children).replace(/\n$/, '')}
-            </SyntaxHighlighter>
-          ) : (
-            <code className={className} {...props}>
-              {children}
-            </code>
-          );
-        },
-      }}
-    >
-      {renderedContent}
-    </ReactMarkdown>
+            return <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>;
+          },
+          p: ({ children, ...props }) => <p {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></p>,
+          li: ({ children, ...props }) => <li {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></li>,
+          h1: ({ children, ...props }) => <h1 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h1>,
+          h2: ({ children, ...props }) => <h2 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h2>,
+          h3: ({ children, ...props }) => <h3 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h3>,
+          img: ({ src, alt, ...props }: any) => {
+            return <ChatImage src={src} alt={alt} conversationId={conversationId} onOpenImage={onOpenImage} {...props} />;
+          },
+          code({ inline, className, children, ...props }: any) {
+            const match = /language-(\w+)/.exec(className || '');
+            const codeText = String(children).replace(/\n$/, '');
+            const codeLineCount = countLines(codeText);
+            const codeTooLarge = codeText.length > MAX_CODE_HIGHLIGHT_CHARS || codeLineCount > MAX_CODE_HIGHLIGHT_LINES;
+            return !inline && match ? (
+              codeTooLarge ? (
+                <pre className="large-code-fallback">
+                  <code>{codeText.length <= MAX_SAFE_FALLBACK_CHARS ? codeText : `${codeText.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`}</code>
+                </pre>
+              ) : (
+                <SyntaxHighlighter
+                  style={vscDarkPlus as any}
+                  language={match[1]}
+                  PreTag="div"
+                  codeTagProps={{ style: { fontSize: 'inherit' } }}
+                  customStyle={{ margin: 0, padding: 0, background: 'transparent', fontSize: 'inherit' }}
+                  {...props}
+                >
+                  {codeText}
+                </SyntaxHighlighter>
+              )
+            ) : (
+              <code className={className} {...props}>
+                {children}
+              </code>
+            );
+          },
+        }}
+      >
+        {renderedContent}
+      </ReactMarkdown>
+    </MarkdownErrorBoundary>
   );
 });
 
@@ -513,6 +698,23 @@ const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationR
   useEffect(() => {
     setThinkingOpen(false);
   }, [msg.id]);
+
+  if (msg.isBridgeStatus) {
+    return (
+      <div className={`message-row assistant bridge-status-message ${isTarget ? 'highlight-target' : ''}`} data-message-id={msg.id}>
+        <div className="message-content">
+          <div className="message-header">
+            <div className="role-label">ChatGPT</div>
+          </div>
+          <div className="bridge-status-bubble">
+            <div className={`bridge-status-text ${msg.bridgeStatusState === 'thinking' ? 'loading-shimmer' : ''}`}>
+              {msg.content}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={`message-row ${msg.role} ${isTarget ? 'highlight-target' : ''}`} data-message-id={msg.id}>
@@ -538,7 +740,7 @@ const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationR
                 <div key={part.id} className="thinking-item">
                   <div className="thinking-role">{part.role}</div>
                   <div className="markdown-body">
-                    <MarkdownMessage content={part.content} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
+                    <MarkdownMessage content={part.content} highlightQuery={highlightQuery} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
                   </div>
                 </div>
               ))}
@@ -546,7 +748,7 @@ const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationR
           </div>
         ) : null}
         <div className="markdown-body">
-          <MarkdownMessage content={msg.content} highlightQuery={isTarget ? highlightQuery : undefined} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
+          <MarkdownMessage content={msg.content} highlightQuery={highlightQuery} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
         </div>
       </div>
     </div>
@@ -587,17 +789,21 @@ function App() {
   const [isReauthenticating, setIsReauthenticating] = useState(false);
   const [bridgeComposerStatus, setBridgeComposerStatus] = useState<BridgeComposerStatus | null>(null);
 
-  const [fontSize, setFontSize] = useState<number>(Number(localStorage.getItem('fontSize')) || 12);
+  const [fontSize, setFontSize] = useState<number>(() => {
+    const raw = Number(localStorage.getItem('fontSize'));
+    return Number.isFinite(raw) ? clampFontSize(raw) : FONT_SIZE_DEFAULT;
+  });
   const [chatWidth, setChatWidth] = useState<number>(Number(localStorage.getItem('chatWidth')) || 800);
   const [showSettings, setShowSettings] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [mapSearchQuery, setMapSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [targetMessageId, setTargetMessageId] = useState<string | null>(null);
   const [activeHighlightQuery, setActiveHighlightQuery] = useState('');
   const [isMessageMapOpen, setIsMessageMapOpen] = useState<boolean>(() => localStorage.getItem('messageMapOpen') !== '0');
-  const [viewportNavMessageId, setViewportNavMessageId] = useState<string | null>(null);
+  const [viewportVisibleMessageIds, setViewportVisibleMessageIds] = useState<string[]>([]);
   const [messageScrollerEl, setMessageScrollerEl] = useState<HTMLElement | null>(null);
 
   const [hasMoreConvs, setHasMoreConvs] = useState(true);
@@ -614,10 +820,22 @@ function App() {
   const panCurrent = useRef({ x: 0, y: 0 });
   const panRaf = useRef<number | null>(null);
   const panScrollTargetRef = useRef<HTMLElement | null>(null);
+  const mapJumpLockUntilRef = useRef<number>(0);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const conversationsScrollerRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const messageListIsScrollingRef = useRef(false);
+  const pendingJumpRef = useRef<{ msgId: string; startedAt: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const oomDebugEnabledRef = useRef<boolean>(localStorage.getItem('oomDebug') === '1');
+  const oomDebugEntriesRef = useRef<OomDebugEntry[]>([]);
+  const oomDebugStateRef = useRef({
+    mapQuery: '',
+    navCount: 0,
+    visibleCount: 0,
+    displayCount: 0,
+    displayViewCount: 0,
+  });
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const activeConvIdRef = useRef<string | null>(localStorage.getItem('lastConvId'));
@@ -643,6 +861,110 @@ function App() {
     if (status.state === 'error' && status.reason) return status.reason;
     return '';
   }, [activeConvId, bridgeComposerStatus]);
+  const bridgeMessageStatus = useMemo(() => {
+    const status = bridgeComposerStatus;
+    if (!status) return null;
+    const sameConversation = (status.conversationId || null) === (activeConvId || null);
+    if (!sameConversation) return null;
+    if (status.state === 'sending') return { state: status.state, text: 'Sending...' };
+    if (status.state === 'warming') return { state: status.state, text: 'Preparing chat...' };
+    if (status.state === 'thinking') return { state: status.state, text: status.reason?.trim() || 'Thinking...' };
+    return null;
+  }, [activeConvId, bridgeComposerStatus]);
+  const displayMessagesForView = useMemo(() => {
+    if (!bridgeMessageStatus) return displayMessages;
+    const bridgeStatusMessage: DisplayMessage = {
+      id: `__bridge-status__${activeConvId || 'new'}`,
+      conversation_id: activeConvId || '',
+      role: 'assistant',
+      content: bridgeMessageStatus.text,
+      created_at: Date.now() / 1000,
+      isBridgeStatus: true,
+      bridgeStatusState: bridgeMessageStatus.state,
+    };
+    return [...displayMessages, bridgeStatusMessage];
+  }, [activeConvId, bridgeMessageStatus, displayMessages]);
+  const getHeapSnapshot = useCallback(() => {
+    const perfAny = performance as Performance & {
+      memory?: {
+        jsHeapSizeLimit: number;
+        totalJSHeapSize: number;
+        usedJSHeapSize: number;
+      };
+    };
+    if (!perfAny.memory) return null;
+    return {
+      usedMB: Math.round((perfAny.memory.usedJSHeapSize / (1024 * 1024)) * 10) / 10,
+      totalMB: Math.round((perfAny.memory.totalJSHeapSize / (1024 * 1024)) * 10) / 10,
+      limitMB: Math.round((perfAny.memory.jsHeapSizeLimit / (1024 * 1024)) * 10) / 10,
+    };
+  }, []);
+  const pushOomDebug = useCallback((event: string, payload: Record<string, unknown> = {}) => {
+    if (!oomDebugEnabledRef.current) return;
+    const domStats = {
+      messageRows: document.querySelectorAll('.message-row[data-message-id]').length,
+      mapItems: document.querySelectorAll('.content-nav-item').length,
+      highlightMarks: document.querySelectorAll('mark.chat-highlight').length,
+      katexNodes: document.querySelectorAll('.katex').length,
+    };
+    const entry: OomDebugEntry = {
+      ts: Date.now(),
+      event,
+      payload: {
+        ...payload,
+        dom: domStats,
+        heap: getHeapSnapshot(),
+      },
+    };
+    const bucket = oomDebugEntriesRef.current;
+    bucket.push(entry);
+    if (bucket.length > 600) bucket.splice(0, bucket.length - 600);
+    // Keep console output compact but continuous for post-mortem.
+    console.debug('[oom-debug]', entry.event, JSON.stringify(entry.payload));
+  }, [getHeapSnapshot]);
+  const mapSearchNeedleRaw = mapSearchQuery.trim();
+  const mapSearchNeedle = useDeferredValue(mapSearchNeedleRaw);
+  const mapSearchNeedleActive = mapSearchNeedle.length >= 2 && mapSearchNeedle.length <= 80 ? mapSearchNeedle : '';
+  const mapSearchRegex = useMemo(() => {
+    if (!mapSearchNeedleActive) return null;
+    try {
+      return new RegExp(escapeRegExp(mapSearchNeedleActive), 'i');
+    } catch {
+      return null;
+    }
+  }, [mapSearchNeedleActive]);
+  const navigationMessages = useMemo(() => (
+    displayMessages
+      .filter(isNavigableMessage)
+      .map((m, i) => ({
+        ...m,
+        navIndex: i + 1,
+        preview: getMessagePreview(m.content),
+      }))
+  ), [displayMessages]);
+  const mapMatchMessageIds = useMemo(() => {
+    if (!mapSearchRegex) return new Set<string>();
+    const matches = new Set<string>();
+    for (const msg of navigationMessages) {
+      const content = msg.content || '';
+      if (!content) continue;
+      // Avoid repeated large string allocations from toLowerCase() on every keypress.
+      if (mapSearchRegex.test(content)) matches.add(msg.id);
+    }
+    return matches;
+  }, [mapSearchRegex, navigationMessages]);
+  const activeMapMessageIds = useMemo(() => (
+    isMessageMapOpen
+      ? new Set(viewportVisibleMessageIds)
+      : (targetMessageId ? new Set([targetMessageId]) : new Set<string>())
+  ), [isMessageMapOpen, targetMessageId, viewportVisibleMessageIds]);
+  const adjustFontSize = useCallback((delta: number) => {
+    if (!Number.isFinite(delta) || delta === 0) return;
+    setFontSize((prev) => clampFontSize(prev + delta));
+  }, []);
+  const resetFontSize = useCallback(() => {
+    setFontSize(FONT_SIZE_DEFAULT);
+  }, []);
 
   const saveVirtuosoState = useCallback((conversationId: string | null) => {
     if (!conversationId || !virtuosoRef.current?.getState) return;
@@ -908,9 +1230,25 @@ function App() {
   };
 
   const jumpToMessageInCurrentChat = useCallback((msgId: string) => {
+    const rowIndex = navigationMessages.findIndex((msg) => msg.id === msgId);
+    const target = rowIndex >= 0 ? navigationMessages[rowIndex] : null;
+    const targetContent = target?.content || '';
+    const scrollerTop = scrollerRef.current ? Math.round(scrollerRef.current.scrollTop) : null;
+    pushOomDebug('map-jump-click', {
+      msgId,
+      rowIndex,
+      scrollerTop,
+      mapQueryLen: mapSearchQuery.length,
+      visibleHighlighted: viewportVisibleMessageIds.length,
+      targetChars: targetContent.length,
+      targetLines: countLines(targetContent),
+    });
+    mapJumpLockUntilRef.current = Date.now() + 900;
+    pendingJumpRef.current = { msgId, startedAt: Date.now() };
+    setViewportVisibleMessageIds([msgId]);
     setTargetMessageId(msgId);
     setActiveHighlightQuery('');
-  }, []);
+  }, [mapSearchQuery.length, navigationMessages, pushOomDebug, viewportVisibleMessageIds.length]);
 
   const handleDeleteConversation = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
@@ -1047,6 +1385,40 @@ function App() {
   }, [fontSize]);
 
   useEffect(() => {
+    const isZoomModifier = (event: KeyboardEvent | WheelEvent) => event.ctrlKey || event.metaKey;
+    const handleWheelZoom = (event: WheelEvent) => {
+      if (!isZoomModifier(event)) return;
+      if (event.deltaY === 0) return;
+      event.preventDefault();
+      adjustFontSize(event.deltaY < 0 ? 1 : -1);
+    };
+    const handleKeyZoom = (event: KeyboardEvent) => {
+      if (!isZoomModifier(event)) return;
+      const key = event.key;
+      if (key === '=' || key === '+' || key === 'Add') {
+        event.preventDefault();
+        adjustFontSize(1);
+        return;
+      }
+      if (key === '-' || key === '_' || key === 'Subtract') {
+        event.preventDefault();
+        adjustFontSize(-1);
+        return;
+      }
+      if (key === '0') {
+        event.preventDefault();
+        resetFontSize();
+      }
+    };
+    window.addEventListener('wheel', handleWheelZoom, { passive: false });
+    window.addEventListener('keydown', handleKeyZoom);
+    return () => {
+      window.removeEventListener('wheel', handleWheelZoom as EventListener);
+      window.removeEventListener('keydown', handleKeyZoom);
+    };
+  }, [adjustFontSize, resetFontSize]);
+
+  useEffect(() => {
     localStorage.setItem('chatWidth', chatWidth.toString());
     document.documentElement.style.setProperty('--message-max-width', `${chatWidth}px`);
   }, [chatWidth]);
@@ -1105,7 +1477,7 @@ function App() {
   }, [fullscreenImage]);
 
   useEffect(() => {
-    setViewportNavMessageId(null);
+    setViewportVisibleMessageIds([]);
   }, [activeConvId]);
 
   useEffect(() => {
@@ -1204,57 +1576,64 @@ function App() {
   };
 
   const updateViewportNavHighlight = useCallback(() => {
+    if (!isMessageMapOpen) return;
+    if (Date.now() < mapJumpLockUntilRef.current) return;
     const scroller = scrollerRef.current;
     if (!scroller) return;
     const scrollerRect = scroller.getBoundingClientRect();
     const viewportTop = scrollerRect.top;
+    const viewportBottom = scrollerRect.bottom;
     const rows = Array.from(scroller.querySelectorAll<HTMLElement>('.message-row[data-message-id]'));
     const navigableIds = new Set(displayMessages.filter(isNavigableMessage).map((m) => m.id));
-    let nextId: string | null = null;
+    const visibleIds: string[] = [];
 
     for (const row of rows) {
       const msgId = row.dataset.messageId || null;
       if (!msgId || !navigableIds.has(msgId)) continue;
       const rect = row.getBoundingClientRect();
-      if (rect.top <= viewportTop && rect.bottom > viewportTop) {
-        nextId = msgId;
-        break;
-      }
+      const visibleTop = Math.max(rect.top, viewportTop);
+      const visibleBottom = Math.min(rect.bottom, viewportBottom);
+      const visiblePx = Math.max(0, visibleBottom - visibleTop);
+      const minVisiblePx = Math.min(28, Math.max(10, rect.height * 0.2));
+      if (visiblePx >= minVisiblePx) visibleIds.push(msgId);
     }
 
-    if (!nextId) {
+    if (visibleIds.length === 0) {
       for (const row of rows) {
         const msgId = row.dataset.messageId || null;
         if (!msgId || !navigableIds.has(msgId)) continue;
-        const top = row.getBoundingClientRect().top;
-        if (top >= scrollerRect.top) {
-          nextId = msgId;
+        const rect = row.getBoundingClientRect();
+        if (rect.top >= viewportTop) {
+          visibleIds.push(msgId);
           break;
         }
       }
     }
 
-    if (!nextId) {
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const row = rows[i];
-        const msgId = row.dataset.messageId || null;
-        if (!msgId || !navigableIds.has(msgId)) continue;
-        nextId = msgId;
-        break;
+    setViewportVisibleMessageIds((prev) => {
+      if (prev.length === visibleIds.length && prev.every((id, idx) => id === visibleIds[idx])) {
+        return prev;
       }
-    }
-
-    setViewportNavMessageId((prev) => (prev === nextId ? prev : nextId));
-  }, [displayMessages]);
+      pushOomDebug('map-visible-update', {
+        prevCount: prev.length,
+        nextCount: visibleIds.length,
+        topId: visibleIds[0] || null,
+        bottomId: visibleIds[visibleIds.length - 1] || null,
+      });
+      return visibleIds;
+    });
+  }, [displayMessages, isMessageMapOpen, pushOomDebug]);
 
   const handleMessageRangeChanged = useCallback(() => {
+    if (messageListIsScrollingRef.current) return;
     updateViewportNavHighlight();
   }, [updateViewportNavHighlight]);
 
   useEffect(() => {
-    if (!messageScrollerEl) return;
+    if (!messageScrollerEl || !isMessageMapOpen) return;
     let rafId: number | null = null;
     const scheduleHighlightUpdate = () => {
+      if (messageListIsScrollingRef.current) return;
       if (rafId !== null) return;
       rafId = requestAnimationFrame(() => {
         rafId = null;
@@ -1269,12 +1648,124 @@ function App() {
       window.removeEventListener('resize', scheduleHighlightUpdate);
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, [messageScrollerEl, updateViewportNavHighlight]);
+  }, [messageScrollerEl, updateViewportNavHighlight, isMessageMapOpen]);
 
   useEffect(() => {
+    if (!isMessageMapOpen) return;
     const timer = window.setTimeout(() => updateViewportNavHighlight(), 0);
     return () => window.clearTimeout(timer);
-  }, [displayMessages, updateViewportNavHighlight]);
+  }, [displayMessages, updateViewportNavHighlight, isMessageMapOpen]);
+
+  useEffect(() => {
+    oomDebugStateRef.current = {
+      mapQuery: mapSearchQuery,
+      navCount: navigationMessages.length,
+      visibleCount: viewportVisibleMessageIds.length,
+      displayCount: displayMessages.length,
+      displayViewCount: displayMessagesForView.length,
+    };
+  }, [mapSearchQuery, navigationMessages.length, viewportVisibleMessageIds.length, displayMessages.length, displayMessagesForView.length]);
+
+  useEffect(() => {
+    const api = {
+      enable: () => {
+        localStorage.setItem('oomDebug', '1');
+        oomDebugEnabledRef.current = true;
+        console.info('[oom-debug] enabled');
+      },
+      disable: () => {
+        localStorage.removeItem('oomDebug');
+        oomDebugEnabledRef.current = false;
+        console.info('[oom-debug] disabled');
+      },
+      clear: () => {
+        oomDebugEntriesRef.current = [];
+        console.info('[oom-debug] cleared');
+      },
+      dump: () => {
+        const rows = oomDebugEntriesRef.current.map((entry) => ({
+          iso: new Date(entry.ts).toISOString(),
+          event: entry.event,
+          ...entry.payload,
+        }));
+        console.table(rows);
+        return rows;
+      },
+      snapshot: () => ({
+        now: new Date().toISOString(),
+        heap: getHeapSnapshot(),
+        ...oomDebugStateRef.current,
+      }),
+    };
+    (window as Window & { __chatgptOomDebug?: typeof api }).__chatgptOomDebug = api;
+    return () => {
+      const win = window as Window & { __chatgptOomDebug?: typeof api };
+      if (win.__chatgptOomDebug === api) delete win.__chatgptOomDebug;
+    };
+  }, [getHeapSnapshot]);
+
+  useEffect(() => {
+    if (!oomDebugEnabledRef.current) return;
+    pushOomDebug('render-stats', {
+      mapQueryLen: mapSearchQuery.length,
+      navCount: navigationMessages.length,
+      visibleCount: viewportVisibleMessageIds.length,
+      displayCount: displayMessages.length,
+      displayViewCount: displayMessagesForView.length,
+    });
+  }, [mapSearchQuery.length, navigationMessages.length, viewportVisibleMessageIds.length, displayMessages.length, displayMessagesForView.length, pushOomDebug]);
+
+  useEffect(() => {
+    const pending = pendingJumpRef.current;
+    if (!pending) return;
+    if (!viewportVisibleMessageIds.includes(pending.msgId)) return;
+    pushOomDebug('map-jump-settled', {
+      msgId: pending.msgId,
+      elapsedMs: Date.now() - pending.startedAt,
+      visibleCount: viewportVisibleMessageIds.length,
+    });
+    pendingJumpRef.current = null;
+  }, [viewportVisibleMessageIds, pushOomDebug]);
+
+  useEffect(() => {
+    if (!oomDebugEnabledRef.current) return;
+    if (typeof PerformanceObserver === 'undefined') return;
+    let obs: PerformanceObserver | null = null;
+    try {
+      obs = new PerformanceObserver((list) => {
+        const entries = list.getEntries();
+        for (const entry of entries) {
+          if (entry.duration >= 120) {
+            pushOomDebug('longtask', {
+              name: entry.name,
+              startTime: Math.round(entry.startTime),
+              durationMs: Math.round(entry.duration),
+            });
+          }
+        }
+      });
+      obs.observe({ entryTypes: ['longtask'] as any });
+    } catch {
+      // longtask not supported in this runtime
+    }
+    return () => {
+      if (obs) obs.disconnect();
+    };
+  }, [pushOomDebug]);
+
+  useEffect(() => {
+    if (!oomDebugEnabledRef.current) return;
+    const id = window.setInterval(() => {
+      pushOomDebug('heartbeat', {
+        mapQueryLen: oomDebugStateRef.current.mapQuery.length,
+        navCount: oomDebugStateRef.current.navCount,
+        visibleCount: oomDebugStateRef.current.visibleCount,
+        displayCount: oomDebugStateRef.current.displayCount,
+        displayViewCount: oomDebugStateRef.current.displayViewCount,
+      });
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [pushOomDebug]);
 
   if (isAuth === null) return <div className="auth-overlay">Loading...</div>;
   if (isAuth === false) return (
@@ -1285,10 +1776,7 @@ function App() {
     </div>
   );
 
-  const navigationMessages = displayMessages
-    .filter(isNavigableMessage)
-    .map((m, i) => ({ ...m, navIndex: i + 1, preview: getMessagePreview(m.content) }));
-  const activeMapMessageId = isMessageMapOpen ? viewportNavMessageId : targetMessageId;
+  const mapHighlightQuery = mapSearchQuery.trim().length >= 2 ? mapSearchQuery.trim() : '';
   const trimmedSearchQuery = searchQuery.trim();
   const searchMatchCount = trimmedSearchQuery ? searchResults.length : 0;
   const hasSendableInput = !!inputValue.trim() || !!pastedImage || attachedFiles.length > 0;
@@ -1372,13 +1860,30 @@ function App() {
           </div>
         </div>
       </div>
-      <div className="main-content">
+      <div className={`main-content ${isMessageMapOpen ? 'map-open' : 'map-closed'}`}>
         <div className="chat-body">
           <div className="chat-pane">
             {isSyncing && <div className="sync-indicator">Syncing...</div>}
             <div className="messages-container" onMouseDown={(e) => startPanning(e, scrollerRef.current)}>
-              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={(el) => { scrollerRef.current = el as HTMLElement; setMessageScrollerEl((el as HTMLElement) || null); }} data={displayMessages} initialTopMostItemIndex={displayMessages.length > 0 ? displayMessages.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} rangeChanged={handleMessageRangeChanged}
-                itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} highlightQuery={activeHighlightQuery} isTarget={targetMessageId === msg.id} onOpenImage={setFullscreenImage} citationRegistry={citationRegistry} />}
+              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={(el) => { scrollerRef.current = el as HTMLElement; setMessageScrollerEl((el as HTMLElement) || null); }} data={displayMessagesForView} initialTopMostItemIndex={displayMessagesForView.length > 0 ? displayMessagesForView.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} defaultItemHeight={180} increaseViewportBy={{ top: mapSearchNeedle ? 420 : 1200, bottom: mapSearchNeedle ? 240 : 400 }} overscan={mapSearchNeedle ? { main: 260, reverse: 320 } : { main: 1000, reverse: 1400 }} isScrolling={(isScrolling) => { messageListIsScrollingRef.current = isScrolling; if (!isScrolling) updateViewportNavHighlight(); }} rangeChanged={handleMessageRangeChanged}
+                itemContent={(_index, msg) => {
+                  const isTarget = targetMessageId === msg.id;
+                  const shouldMapHighlight = !!mapHighlightQuery && mapMatchMessageIds.has(msg.id);
+                  const messageIsHighlightSafe = shouldMapHighlight
+                    ? countNeedleHits(msg.content || '', mapHighlightQuery.toLowerCase()) <= MAX_MESSAGE_HIGHLIGHT_HITS
+                    : true;
+                  const highlightQuery = (shouldMapHighlight && messageIsHighlightSafe) ? mapHighlightQuery : (isTarget ? activeHighlightQuery : '');
+                  return (
+                    <MessageRow
+                      key={msg.id}
+                      msg={msg}
+                      highlightQuery={highlightQuery}
+                      isTarget={isTarget}
+                      onOpenImage={setFullscreenImage}
+                      citationRegistry={citationRegistry}
+                    />
+                  );
+                }}
               />
             </div>
           </div>
@@ -1398,7 +1903,7 @@ function App() {
               {navigationMessages.map((msg) => (
                 <button
                   key={msg.id}
-                  className={`content-nav-item ${msg.role === 'user' ? 'role-user' : 'role-assistant'} ${activeMapMessageId === msg.id ? 'active' : ''}`}
+                  className={`content-nav-item ${msg.role === 'user' ? 'role-user' : 'role-assistant'} ${activeMapMessageIds.has(msg.id) ? 'active' : ''} ${mapMatchMessageIds.has(msg.id) ? 'match' : ''}`}
                   onClick={() => jumpToMessageInCurrentChat(msg.id)}
                   title={msg.preview}
                 >
@@ -1406,6 +1911,54 @@ function App() {
                   <span className="content-nav-text">{msg.preview}</span>
                 </button>
               ))}
+            </div>
+            <div className="content-nav-search">
+              <input
+                type="text"
+                className="content-nav-search-input"
+                placeholder="Find in this chat..."
+                value={mapSearchQuery}
+                onMouseDown={(e) => {
+                  if (e.button === 1) e.preventDefault();
+                }}
+                onAuxClick={(e) => {
+                  if (e.button === 1) e.preventDefault();
+                }}
+                onPaste={(e) => {
+                  const text = e.clipboardData?.getData('text') || '';
+                  if (!text) return;
+                  e.preventDefault();
+                  const next = sanitizeMapSearchQuery(text);
+                  if (text.length > MAX_MAP_SEARCH_QUERY_LEN) {
+                    pushOomDebug('map-search-truncated', {
+                      rawLen: text.length,
+                      keptLen: next.length,
+                      source: 'paste',
+                    });
+                  }
+                  pushOomDebug('map-search-change', {
+                    queryLen: next.length,
+                    navCount: navigationMessages.length,
+                    source: 'paste',
+                  });
+                  setMapSearchQuery(next);
+                }}
+                onChange={(e) => {
+                  const rawNext = e.target.value;
+                  const next = sanitizeMapSearchQuery(rawNext);
+                  if (rawNext.length > MAX_MAP_SEARCH_QUERY_LEN) {
+                    pushOomDebug('map-search-truncated', {
+                      rawLen: rawNext.length,
+                      keptLen: next.length,
+                    });
+                  }
+                  pushOomDebug('map-search-change', {
+                    queryLen: next.length,
+                    navCount: navigationMessages.length,
+                  });
+                  setMapSearchQuery(next);
+                }}
+              />
             </div>
           </aside>
         </div>
@@ -1415,11 +1968,6 @@ function App() {
                 <div className="send-error-banner">
                   <span>{sendError}</span>
                   <button className="send-error-dismiss" onClick={() => setSendError(null)} aria-label="Dismiss send error">×</button>
-                </div>
-              )}
-              {bridgeActivityLabel && !sendError && (
-                <div className={`bridge-status-banner ${bridgeComposerStatus?.state === 'error' ? 'error' : ''}`}>
-                  <span>{bridgeActivityLabel}</span>
                 </div>
               )}
               {pastedImage && <div className="image-preview"><img src={pastedImage} alt="Pasted" /><button className="remove-image" onClick={() => setPastedImage(null)}>×</button></div>}
@@ -1451,9 +1999,33 @@ function App() {
                   </button>
                   {showModelMenu && <div className="model-picker-menu">{['Auto', 'Instant 5.3', 'Thinking 5.4 Standard', 'Thinking 5.4 Extended', 'Thinking 5.5 Standard', 'Thinking 5.5 Extended'].map(m => <button key={m} className={`model-picker-option ${selectedModel === m ? 'active' : ''}`} onClick={() => { setSelectedModel(m); setShowModelMenu(false); }}>{m}</button>)}</div>}
                 </div>
-              <textarea ref={textareaRef} className="chat-input" placeholder="Send a message..." rows={1} value={inputValue} onChange={(e) => setInputValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }} />
-              <button className={`send-btn ${isBridgeReadyForActiveConversation ? 'ready' : 'not-ready'}`} onClick={handleSend} disabled={isSendDisabled}><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
-            </div>
+	              <textarea
+	                ref={textareaRef}
+	                className="chat-input"
+	                placeholder="Send a message..."
+	                rows={1}
+	                value={inputValue}
+	                onChange={(e) => setInputValue(e.target.value)}
+	                onMouseDown={(e) => {
+	                  if (e.button === 1) e.preventDefault();
+	                }}
+	                onAuxClick={(e) => {
+	                  if (e.button === 1) e.preventDefault();
+	                }}
+	                onKeyDown={(e) => {
+	                  if (e.key === 'Enter' && !e.shiftKey) {
+	                    e.preventDefault();
+	                    handleSend();
+	                  }
+	                }}
+	              />
+	              {bridgeActivityLabel && !sendError && (
+	                <span className={`bridge-status-inline ${bridgeComposerStatus?.state === 'error' ? 'error' : ''}`}>
+	                  {bridgeActivityLabel}
+	                </span>
+	              )}
+	              <button className={`send-btn ${isBridgeReadyForActiveConversation ? 'ready' : 'not-ready'}`} onClick={handleSend} disabled={isSendDisabled}><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+	            </div>
           </div>
         </div>
       </div>
@@ -1466,7 +2038,7 @@ function App() {
             </div>
             <div className="setting-item">
               <label>Font Size <span className="setting-value">{fontSize}pt</span></label>
-              <input type="range" min="8" max="20" value={fontSize} onChange={(e) => setFontSize(parseInt(e.target.value))} />
+              <input type="range" min={FONT_SIZE_MIN} max={FONT_SIZE_MAX} value={fontSize} onChange={(e) => setFontSize(clampFontSize(parseInt(e.target.value, 10)))} />
             </div>
             <div className="setting-item">
               <label>Chat Column Width <span className="setting-value">{chatWidth}px</span></label>

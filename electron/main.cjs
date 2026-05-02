@@ -4,6 +4,21 @@ const ChatGPTAuth = require('./auth.cjs');
 const ChatDatabase = require('./database.cjs');
 
 const isDev = process.env.NODE_ENV === 'development';
+const OOM_DEBUG = process.env.CHATGPT_OOM_DEBUG === '1';
+const OOM_TRACE_GC = process.env.CHATGPT_TRACE_GC === '1';
+
+if (OOM_DEBUG) {
+  const jsFlags = [
+    '--max-old-space-size=8192',
+    '--expose-gc',
+    OOM_TRACE_GC ? '--trace-gc' : '',
+  ].filter(Boolean).join(' ');
+  app.commandLine.appendSwitch('js-flags', jsFlags);
+  app.commandLine.appendSwitch('enable-precise-memory-info');
+  app.commandLine.appendSwitch('remote-debugging-port', process.env.CHATGPT_REMOTE_DEBUG_PORT || '9222');
+  app.commandLine.appendSwitch('enable-logging');
+  app.commandLine.appendSwitch('log-level', '0');
+}
 
 let mainWindow;
 let auth;
@@ -19,6 +34,8 @@ let bridgeComposerStatus = {
   updatedAt: Date.now(),
 };
 let bridgeGenerationMonitorToken = 0;
+let oomMetricsTimer = null;
+let oomMemoryInfoWarned = false;
 
 const shouldShowBridgeWindow = () => isDev || process.env.CHATGPT_BRIDGE_VISIBLE === '1';
 const BRIDGE_FAST_MODE = process.env.CHATGPT_BRIDGE_FAST_MODE !== '0';
@@ -395,6 +412,98 @@ function normalizeChatgptUrl(value) {
   }
 }
 
+function formatKbToMB(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  return Math.round((num / 1024) * 10) / 10;
+}
+
+async function getWebContentsMemorySummary(webContents) {
+  if (!webContents || webContents.isDestroyed()) return null;
+  try {
+    const proc = await webContents.getProcessMemoryInfo();
+    return {
+      rssMB: formatKbToMB(proc.residentSet),
+      privateMB: formatKbToMB(proc.private),
+      sharedMB: formatKbToMB(proc.shared),
+    };
+  } catch (error) {
+    if (OOM_DEBUG && !oomMemoryInfoWarned) {
+      oomMemoryInfoWarned = true;
+      console.warn('[oom-main] getProcessMemoryInfo unavailable:', String(error?.message || error));
+    }
+    return null;
+  }
+}
+
+async function logRendererMetrics(reason) {
+  if (!OOM_DEBUG) return;
+  try {
+    const metrics = app.getAppMetrics();
+    const safePid = (win) => {
+      try {
+        if (!win || win.isDestroyed()) return null;
+        const wc = win.webContents;
+        if (!wc || wc.isDestroyed()) return null;
+        return wc.getOSProcessId();
+      } catch {
+        return null;
+      }
+    };
+    const mainPid = safePid(mainWindow);
+    const bridgePid = safePid(bridgeWindow);
+    const findByPid = (pid) => metrics.find((m) => Number(m.pid) === Number(pid)) || null;
+    const slim = (metric) => {
+      if (!metric) return null;
+      return {
+        pid: metric.pid,
+        type: metric.type,
+        wsMB: formatKbToMB(metric.memory?.workingSetSize),
+        privMB: formatKbToMB(metric.memory?.privateBytes),
+        sharedMB: formatKbToMB(metric.memory?.sharedBytes),
+      };
+    };
+    const [mainProc, bridgeProc] = await Promise.all([
+      getWebContentsMemorySummary(mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null),
+      getWebContentsMemorySummary(bridgeWindow && !bridgeWindow.isDestroyed() ? bridgeWindow.webContents : null),
+    ]);
+    console.info('[oom-main]', JSON.stringify({
+      ts: new Date().toISOString(),
+      reason,
+      main: slim(findByPid(mainPid)),
+      bridge: slim(findByPid(bridgePid)),
+      mainProc,
+      bridgeProc,
+    }));
+  } catch (error) {
+    console.warn('[oom-main] metrics read failed', error);
+  }
+}
+
+function attachRendererDiagnostics(label, webContents) {
+  if (!OOM_DEBUG || !webContents) return;
+  webContents.on('render-process-gone', (_event, details) => {
+    console.error(`[oom-main] ${label} render-process-gone`, details);
+    logRendererMetrics(`${label}:render-process-gone`);
+  });
+  webContents.on('unresponsive', () => {
+    console.error(`[oom-main] ${label} unresponsive`);
+    logRendererMetrics(`${label}:unresponsive`);
+  });
+}
+
+function startOomMetricsProbe() {
+  if (!OOM_DEBUG || oomMetricsTimer) return;
+  logRendererMetrics('startup').catch((error) => {
+    console.warn('[oom-main] startup metrics failed', error);
+  });
+  oomMetricsTimer = setInterval(() => {
+    logRendererMetrics('heartbeat').catch((error) => {
+      console.warn('[oom-main] heartbeat metrics failed', error);
+    });
+  }, 2000);
+}
+
 async function ensureBridgeWindow() {
   if (bridgeWindow && !bridgeWindow.isDestroyed()) {
     return bridgeWindow;
@@ -420,6 +529,7 @@ async function ensureBridgeWindow() {
       ],
     },
   });
+  attachRendererDiagnostics('bridge', bridgeWindow.webContents);
 
   if (!shouldShowBridgeWindow()) {
     bridgeWindow.setSkipTaskbar(true);
@@ -539,20 +649,15 @@ async function waitForBridgeComposer(win, conversationId) {
     const hasMessagesForConversation = !conversationId || Number(lastState?.messageCount || 0) > 0;
     const fastInstalled = !!lastState?.fastModeInstalled;
     const fastMeta = lastState?.fastModeMeta || null;
-    const trimFreshForConversation =
-      !conversationId || (
-        fastMeta &&
-        fastMeta.lastConversationId === conversationId &&
-        (Date.now() - Number(fastMeta.lastConversationFetchAt || 0)) < 20000
+    const domAlreadyTrimmed = Number(lastState?.messageCount || 0) > 0 && Number(lastState?.messageCount || 0) <= expectedVisibleLimit;
+    const trimWorkedByMeta =
+      !!fastMeta &&
+      fastMeta.lastConversationId === conversationId &&
+      (
+        Number(fastMeta.lastOriginalVisible || 0) <= expectedVisibleLimit ||
+        Number(fastMeta.lastKeptVisible || 0) <= expectedVisibleLimit
       );
-    const trimWorked =
-      !conversationId || (
-        !!fastMeta && (
-          Number(fastMeta.lastOriginalVisible || 0) <= expectedVisibleLimit ||
-          Number(fastMeta.lastKeptVisible || 0) <= expectedVisibleLimit
-        )
-      );
-    const trimmedConversationReady = !conversationId || (fastInstalled && trimFreshForConversation && trimWorked);
+    const trimmedConversationReady = !conversationId || !BRIDGE_FAST_MODE || domAlreadyTrimmed || !fastInstalled || trimWorkedByMeta;
     
     if (
       pathOk &&
@@ -1030,6 +1135,7 @@ function createWindow() {
       contextIsolation: true,
     },
   });
+  attachRendererDiagnostics('main', mainWindow.webContents);
 
   // Register custom protocol for images
   // This allows us to fetch images in the main process with full auth
@@ -1541,13 +1647,24 @@ app.whenReady().then(() => {
   db = new ChatDatabase();
   setupIpc();
   createWindow();
+  startOomMetricsProbe();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+  if (OOM_DEBUG) {
+    app.on('child-process-gone', (_event, details) => {
+      console.error('[oom-main] child-process-gone', details);
+      logRendererMetrics('child-process-gone');
+    });
+  }
 });
 
 app.on('window-all-closed', () => {
+  if (oomMetricsTimer) {
+    clearInterval(oomMetricsTimer);
+    oomMetricsTimer = null;
+  }
   if (bridgeWindow && !bridgeWindow.isDestroyed()) {
     bridgeWindow.close();
     bridgeWindow = null;
