@@ -33,8 +33,21 @@ const MAX_SAFE_FALLBACK_CHARS = 120000;
 const FONT_SIZE_MIN = 8;
 const FONT_SIZE_MAX = 20;
 const FONT_SIZE_DEFAULT = 12;
+const SIDEBAR_WIDTH_MIN = 180;
+const SIDEBAR_WIDTH_MAX = 520;
+const SIDEBAR_WIDTH_DEFAULT = 216;
+const MAP_WIDTH_MIN = 180;
+const MAP_WIDTH_MAX = 520;
+const MAP_WIDTH_DEFAULT = 250;
 const clampFontSize = (value: number) =>
   Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, Math.round(value)));
+const clampPanelWidth = (value: number, min: number, max: number) =>
+  Math.max(min, Math.min(max, Math.round(value)));
+const loadStoredPanelWidth = (key: string, fallback: number, min: number, max: number) => {
+  const raw = Number(localStorage.getItem(key));
+  if (!Number.isFinite(raw)) return fallback;
+  return clampPanelWidth(raw, min, max);
+};
 
 const getMessagePreview = (content: string) => {
   const normalized = content
@@ -793,6 +806,13 @@ function App() {
     const raw = Number(localStorage.getItem('fontSize'));
     return Number.isFinite(raw) ? clampFontSize(raw) : FONT_SIZE_DEFAULT;
   });
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() =>
+    loadStoredPanelWidth('sidebarWidth', SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX)
+  );
+  const [mapPanelWidth, setMapPanelWidth] = useState<number>(() =>
+    loadStoredPanelWidth('mapPanelWidth', MAP_WIDTH_DEFAULT, MAP_WIDTH_MIN, MAP_WIDTH_MAX)
+  );
+  const [activeResizer, setActiveResizer] = useState<'sidebar' | 'map' | null>(null);
   const [chatWidth, setChatWidth] = useState<number>(Number(localStorage.getItem('chatWidth')) || 800);
   const [showSettings, setShowSettings] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
@@ -802,9 +822,9 @@ function App() {
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [targetMessageId, setTargetMessageId] = useState<string | null>(null);
   const [activeHighlightQuery, setActiveHighlightQuery] = useState('');
+  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() => localStorage.getItem('sidebarOpen') !== '0');
   const [isMessageMapOpen, setIsMessageMapOpen] = useState<boolean>(() => localStorage.getItem('messageMapOpen') !== '0');
   const [viewportVisibleMessageIds, setViewportVisibleMessageIds] = useState<string[]>([]);
-  const [messageScrollerEl, setMessageScrollerEl] = useState<HTMLElement | null>(null);
 
   const [hasMoreConvs, setHasMoreConvs] = useState(true);
   const [isLoadingMoreConvs, setIsLoadingMoreConvs] = useState(false);
@@ -823,9 +843,12 @@ function App() {
   const mapJumpLockUntilRef = useRef<number>(0);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const conversationsScrollerRef = useRef<HTMLElement | null>(null);
+  const mapOpenRef = useRef(isMessageMapOpen);
+  const viewportHighlightRafRef = useRef<number | null>(null);
+  const updateViewportNavHighlightRef = useRef<() => void>(() => {});
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const messageListIsScrollingRef = useRef(false);
   const pendingJumpRef = useRef<{ msgId: string; startedAt: number } | null>(null);
+  const panelResizeRef = useRef<{ type: 'sidebar' | 'map'; startX: number; startWidth: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const oomDebugEnabledRef = useRef<boolean>(localStorage.getItem('oomDebug') === '1');
   const oomDebugEntriesRef = useRef<OomDebugEntry[]>([]);
@@ -965,6 +988,40 @@ function App() {
   const resetFontSize = useCallback(() => {
     setFontSize(FONT_SIZE_DEFAULT);
   }, []);
+  const scheduleViewportHighlightUpdate = useCallback(() => {
+    if (!mapOpenRef.current) return;
+    if (viewportHighlightRafRef.current !== null) return;
+    viewportHighlightRafRef.current = requestAnimationFrame(() => {
+      viewportHighlightRafRef.current = null;
+      updateViewportNavHighlightRef.current();
+    });
+  }, []);
+  const handleMessageScrollerRef = useCallback((el: HTMLElement | null) => {
+    if (scrollerRef.current === el) return;
+    if (scrollerRef.current) {
+      scrollerRef.current.removeEventListener('scroll', scheduleViewportHighlightUpdate);
+    }
+    scrollerRef.current = el;
+    if (el) {
+      el.addEventListener('scroll', scheduleViewportHighlightUpdate, { passive: true });
+    }
+    scheduleViewportHighlightUpdate();
+  }, [scheduleViewportHighlightUpdate]);
+  const handleConversationsScrollerRef = useCallback((el: HTMLElement | null) => {
+    conversationsScrollerRef.current = el;
+  }, []);
+  const handleSidebarResizeStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    panelResizeRef.current = { type: 'sidebar', startX: e.clientX, startWidth: sidebarWidth };
+    setActiveResizer('sidebar');
+  }, [sidebarWidth]);
+  const handleMapResizeStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    panelResizeRef.current = { type: 'map', startX: e.clientX, startWidth: mapPanelWidth };
+    setActiveResizer('map');
+  }, [mapPanelWidth]);
 
   const saveVirtuosoState = useCallback((conversationId: string | null) => {
     if (!conversationId || !virtuosoRef.current?.getState) return;
@@ -1383,6 +1440,44 @@ function App() {
     localStorage.setItem('fontSize', fontSize.toString());
     document.documentElement.style.setProperty('--app-font-size', `${fontSize}pt`);
   }, [fontSize]);
+  useEffect(() => {
+    localStorage.setItem('sidebarWidth', String(sidebarWidth));
+  }, [sidebarWidth]);
+  useEffect(() => {
+    localStorage.setItem('sidebarOpen', isSidebarOpen ? '1' : '0');
+  }, [isSidebarOpen]);
+  useEffect(() => {
+    localStorage.setItem('mapPanelWidth', String(mapPanelWidth));
+  }, [mapPanelWidth]);
+  useEffect(() => {
+    if (!activeResizer) return;
+    const handleMouseMove = (event: MouseEvent) => {
+      const resize = panelResizeRef.current;
+      if (!resize) return;
+      const deltaX = event.clientX - resize.startX;
+      if (resize.type === 'sidebar') {
+        setSidebarWidth(clampPanelWidth(resize.startWidth + deltaX, SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX));
+        return;
+      }
+      setMapPanelWidth(clampPanelWidth(resize.startWidth - deltaX, MAP_WIDTH_MIN, MAP_WIDTH_MAX));
+    };
+    const handleMouseUp = () => {
+      panelResizeRef.current = null;
+      setActiveResizer(null);
+    };
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [activeResizer]);
 
   useEffect(() => {
     const isZoomModifier = (event: KeyboardEvent | WheelEvent) => event.ctrlKey || event.metaKey;
@@ -1624,31 +1719,37 @@ function App() {
     });
   }, [displayMessages, isMessageMapOpen, pushOomDebug]);
 
+  useEffect(() => {
+    updateViewportNavHighlightRef.current = updateViewportNavHighlight;
+  }, [updateViewportNavHighlight]);
+
   const handleMessageRangeChanged = useCallback(() => {
-    if (messageListIsScrollingRef.current) return;
     updateViewportNavHighlight();
   }, [updateViewportNavHighlight]);
 
   useEffect(() => {
-    if (!messageScrollerEl || !isMessageMapOpen) return;
-    let rafId: number | null = null;
-    const scheduleHighlightUpdate = () => {
-      if (messageListIsScrollingRef.current) return;
-      if (rafId !== null) return;
-      rafId = requestAnimationFrame(() => {
-        rafId = null;
-        updateViewportNavHighlight();
-      });
-    };
-    messageScrollerEl.addEventListener('scroll', scheduleHighlightUpdate, { passive: true });
-    window.addEventListener('resize', scheduleHighlightUpdate, { passive: true });
-    scheduleHighlightUpdate();
+    mapOpenRef.current = isMessageMapOpen;
+    if (isMessageMapOpen) {
+      scheduleViewportHighlightUpdate();
+    }
+  }, [isMessageMapOpen, scheduleViewportHighlightUpdate]);
+
+  useEffect(() => {
+    window.addEventListener('resize', scheduleViewportHighlightUpdate, { passive: true });
     return () => {
-      messageScrollerEl.removeEventListener('scroll', scheduleHighlightUpdate);
-      window.removeEventListener('resize', scheduleHighlightUpdate);
-      if (rafId !== null) cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', scheduleViewportHighlightUpdate);
     };
-  }, [messageScrollerEl, updateViewportNavHighlight, isMessageMapOpen]);
+  }, [scheduleViewportHighlightUpdate]);
+
+  useEffect(() => () => {
+    if (viewportHighlightRafRef.current !== null) {
+      cancelAnimationFrame(viewportHighlightRafRef.current);
+      viewportHighlightRafRef.current = null;
+    }
+    if (scrollerRef.current) {
+      scrollerRef.current.removeEventListener('scroll', scheduleViewportHighlightUpdate);
+    }
+  }, [scheduleViewportHighlightUpdate]);
 
   useEffect(() => {
     if (!isMessageMapOpen) return;
@@ -1781,91 +1882,123 @@ function App() {
   const searchMatchCount = trimmedSearchQuery ? searchResults.length : 0;
   const hasSendableInput = !!inputValue.trim() || !!pastedImage || attachedFiles.length > 0;
   const isSendDisabled = isSending || !hasSendableInput || !isBridgeReadyForActiveConversation;
+  const toggleSidebar = () => {
+    setIsSidebarOpen((prev) => {
+      if (prev && activeResizer === 'sidebar') {
+        panelResizeRef.current = null;
+        setActiveResizer(null);
+      }
+      return !prev;
+    });
+  };
+  const appContainerStyle = {
+    ['--sidebar-width' as any]: `${sidebarWidth}px`,
+    ['--content-nav-width' as any]: `${mapPanelWidth}px`,
+  } as React.CSSProperties;
 
   return (
-    <div className="app-container">
+    <div className="app-container" style={appContainerStyle}>
       {isPanning && (
         <div className="pan-overlay">
           <div className="pan-center" style={{ left: panPosition.x, top: panPosition.y }} />
         </div>
       )}
-      <div className="sidebar">
-        <div className="sidebar-header">
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <button className="new-chat-btn" onClick={() => { saveVirtuosoState(activeConvIdRef.current); setActiveConvId(null); setMessages([]); activeConvIdRef.current = null; setRestoreVirtuosoState(null); window.electronAPI.invoke('api:prewarmConversation', { conversationId: null }).catch((error) => console.warn('Failed to prewarm new chat bridge', error)); }}>+ New Chat</button>
-            <button className="search-trigger-btn" onClick={() => setShowSearch(true)} title="Search Chats">
-              <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-            </button>
-          </div>
-        </div>
-        <div className="conversations-list" onMouseDown={(e) => startPanning(e, conversationsScrollerRef.current || (e.currentTarget as HTMLElement))}>
-          <Virtuoso
-            data={conversations}
-            endReached={loadMoreConversations}
-            scrollerRef={(el) => { conversationsScrollerRef.current = (el as HTMLElement) || null; }}
-            itemContent={(_index, conv) => (
-              <ConversationItem 
-                key={conv.id} 
-                conv={conv} 
-                active={activeConvId === conv.id} 
-                onClick={() => selectConversation(conv.id)} 
-                onDelete={(e) => handleDeleteConversation(e, conv.id)}
-              />
-            )}
-            components={{ Footer: () => isLoadingMoreConvs ? <div style={{ padding: '10px', textAlign: 'center', fontSize: '12px', color: '#c5c5d2' }}>Loading more...</div> : null }}
-          />
-        </div>
-        <div className="sidebar-footer">
-          <div className="cache-stats-container">
-            <div className="cache-stats-text">
-              <div className="cache-stats-line">
-                <span className="stats-label">Cached:</span>
-                <span className="stats-value">{cacheStats.cachedCount} / {cacheStats.localCount}</span>
-              </div>
-              <div className="cache-stats-line" title="Uncached chats split by known failed fetches vs unknown/no-data cases">
-                <span className="stats-label">Uncached:</span>
-                <span className="stats-value">{cacheDiagnostics.uncachedCount}</span>
-                <span className="stats-subvalue">fail {cacheDiagnostics.failedCount} · unknown {cacheDiagnostics.unknownCount}</span>
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: '6px' }}>
-              <button
-                className="cache-all-btn"
-                onClick={handleRetryFailedCache}
-                disabled={isCachingAll || cacheDiagnostics.failedCount === 0}
-                title="Retry only conversations with known cache failures"
-              >
-                Retry failed
-              </button>
-              <button 
-                className={`cache-all-btn ${isCachingAll ? 'spinning' : ''}`} 
-                onClick={handleCacheAll} 
-                disabled={isCachingAll || cacheStats.cachedCount === cacheStats.localCount}
-                title="Cache all missing chats locally"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-                  <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
-                </svg>
+      {isSidebarOpen ? (
+        <div className="sidebar">
+          <div className="sidebar-header">
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="new-chat-btn" onClick={() => { saveVirtuosoState(activeConvIdRef.current); setActiveConvId(null); setMessages([]); activeConvIdRef.current = null; setRestoreVirtuosoState(null); window.electronAPI.invoke('api:prewarmConversation', { conversationId: null }).catch((error) => console.warn('Failed to prewarm new chat bridge', error)); }}>+ New Chat</button>
+              <button className="search-trigger-btn" onClick={() => setShowSearch(true)} title="Search Chats">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
               </button>
             </div>
           </div>
-          <div className="footer-actions">
-            <button className="sync-btn-sidebar" onClick={() => activeConvId && selectConversation(activeConvId, true, true)} title="Sync current chat">
-              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-            </button>
-            <button className="settings-btn" onClick={() => setShowSettings(true)}>
-              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
-              Settings
-            </button>
+          <div className="conversations-list" onMouseDown={(e) => startPanning(e, conversationsScrollerRef.current || (e.currentTarget as HTMLElement))}>
+            <Virtuoso
+              data={conversations}
+              endReached={loadMoreConversations}
+              scrollerRef={handleConversationsScrollerRef as any}
+              itemContent={(_index, conv) => (
+                <ConversationItem 
+                  key={conv.id} 
+                  conv={conv} 
+                  active={activeConvId === conv.id} 
+                  onClick={() => selectConversation(conv.id)} 
+                  onDelete={(e) => handleDeleteConversation(e, conv.id)}
+                />
+              )}
+              components={{ Footer: () => isLoadingMoreConvs ? <div style={{ padding: '10px', textAlign: 'center', fontSize: '12px', color: '#c5c5d2' }}>Loading more...</div> : null }}
+            />
+          </div>
+          <div className="sidebar-footer">
+            <div className="cache-stats-container">
+              <div className="cache-stats-text">
+                <div className="cache-stats-line">
+                  <span className="stats-label">Cached:</span>
+                  <span className="stats-value">{cacheStats.cachedCount} / {cacheStats.localCount}</span>
+                </div>
+                <div className="cache-stats-line" title="Uncached chats split by known failed fetches vs unknown/no-data cases">
+                  <span className="stats-label">Uncached:</span>
+                  <span className="stats-value">{cacheDiagnostics.uncachedCount}</span>
+                  <span className="stats-subvalue">fail {cacheDiagnostics.failedCount} · unknown {cacheDiagnostics.unknownCount}</span>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button
+                  className="cache-all-btn"
+                  onClick={handleRetryFailedCache}
+                  disabled={isCachingAll || cacheDiagnostics.failedCount === 0}
+                  title="Retry only conversations with known cache failures"
+                >
+                  Retry failed
+                </button>
+                <button 
+                  className={`cache-all-btn ${isCachingAll ? 'spinning' : ''}`} 
+                  onClick={handleCacheAll} 
+                  disabled={isCachingAll || cacheStats.cachedCount === cacheStats.localCount}
+                  title="Cache all missing chats locally"
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                    <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div className="footer-actions">
+              <button className="sync-btn-sidebar" onClick={() => activeConvId && selectConversation(activeConvId, true, true)} title="Sync current chat">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+              </button>
+              <button className="settings-btn" onClick={() => setShowSettings(true)}>
+                <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                Settings
+              </button>
+            </div>
           </div>
         </div>
-      </div>
-      <div className={`main-content ${isMessageMapOpen ? 'map-open' : 'map-closed'}`}>
+      ) : null}
+      {isSidebarOpen ? (
+        <div
+          className={`panel-resizer sidebar-resizer ${activeResizer === 'sidebar' ? 'active' : ''}`}
+          onMouseDown={handleSidebarResizeStart}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize chat list panel"
+        />
+      ) : null}
+      <div className={`main-content ${isSidebarOpen ? 'sidebar-open' : 'sidebar-closed'} ${isMessageMapOpen ? 'map-open' : 'map-closed'}`}>
+        <button
+          className={`sidebar-toggle ${isSidebarOpen ? 'open' : 'closed'}`}
+          onClick={toggleSidebar}
+          title={isSidebarOpen ? 'Hide chat list' : 'Show chat list'}
+          aria-label={isSidebarOpen ? 'Hide chat list' : 'Show chat list'}
+        >
+          {isSidebarOpen ? '‹' : '›'}
+        </button>
         <div className="chat-body">
           <div className="chat-pane">
             {isSyncing && <div className="sync-indicator">Syncing...</div>}
             <div className="messages-container" onMouseDown={(e) => startPanning(e, scrollerRef.current)}>
-              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={(el) => { scrollerRef.current = el as HTMLElement; setMessageScrollerEl((el as HTMLElement) || null); }} data={displayMessagesForView} initialTopMostItemIndex={displayMessagesForView.length > 0 ? displayMessagesForView.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} defaultItemHeight={180} increaseViewportBy={{ top: mapSearchNeedle ? 420 : 1200, bottom: mapSearchNeedle ? 240 : 400 }} overscan={mapSearchNeedle ? { main: 260, reverse: 320 } : { main: 1000, reverse: 1400 }} isScrolling={(isScrolling) => { messageListIsScrollingRef.current = isScrolling; if (!isScrolling) updateViewportNavHighlight(); }} rangeChanged={handleMessageRangeChanged}
+              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={handleMessageScrollerRef as any} data={displayMessagesForView} initialTopMostItemIndex={displayMessagesForView.length > 0 ? displayMessagesForView.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} defaultItemHeight={180} increaseViewportBy={{ top: mapSearchNeedle ? 420 : 1200, bottom: mapSearchNeedle ? 240 : 400 }} overscan={mapSearchNeedle ? { main: 260, reverse: 320 } : { main: 1000, reverse: 1400 }} isScrolling={(isScrolling) => { if (isScrolling) scheduleViewportHighlightUpdate(); else updateViewportNavHighlight(); }} rangeChanged={handleMessageRangeChanged}
                 itemContent={(_index, msg) => {
                   const isTarget = targetMessageId === msg.id;
                   const shouldMapHighlight = !!mapHighlightQuery && mapMatchMessageIds.has(msg.id);
@@ -1887,6 +2020,15 @@ function App() {
               />
             </div>
           </div>
+          {isMessageMapOpen ? (
+            <div
+              className={`panel-resizer content-nav-resizer ${activeResizer === 'map' ? 'active' : ''}`}
+              onMouseDown={handleMapResizeStart}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize message map panel"
+            />
+          ) : null}
           <button
             className={`content-nav-toggle ${isMessageMapOpen ? 'open' : 'closed'}`}
             onClick={() => setIsMessageMapOpen((prev) => !prev)}
