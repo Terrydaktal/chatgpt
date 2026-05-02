@@ -10,8 +10,295 @@ let auth;
 let db;
 let bridgeWindow = null;
 let appUserAgent = null;
+let bridgeWarmRequestToken = 0;
+let bridgeComposerStatus = {
+  conversationId: null,
+  state: 'idle',
+  ready: false,
+  reason: '',
+  updatedAt: Date.now(),
+};
+let bridgeGenerationMonitorToken = 0;
 
 const shouldShowBridgeWindow = () => isDev || process.env.CHATGPT_BRIDGE_VISIBLE === '1';
+const BRIDGE_FAST_MODE = process.env.CHATGPT_BRIDGE_FAST_MODE !== '0';
+const BRIDGE_FAST_TURNS = Math.max(1, Number(process.env.CHATGPT_BRIDGE_FAST_TURNS || 1));
+const BRIDGE_FAST_CACHE = Math.max(1, Number(process.env.CHATGPT_BRIDGE_FAST_CACHE || 5));
+const BRIDGE_RESOURCE_BLOCKING = process.env.CHATGPT_BRIDGE_RESOURCE_BLOCKING === '1';
+const BRIDGE_BLOCKED_RESOURCE_TYPES = new Set(['image', 'imageset', 'media', 'font']);
+let bridgeRequestBlockerInstalled = false;
+
+function isAbortedNavigationError(errorOrCode) {
+  if (typeof errorOrCode === 'number') return errorOrCode === -3;
+  return !!(
+    errorOrCode &&
+    (errorOrCode.code === 'ERR_ABORTED' || errorOrCode.errno === -3)
+  );
+}
+
+function publishBridgeComposerStatus(patch) {
+  bridgeComposerStatus = {
+    ...bridgeComposerStatus,
+    ...patch,
+    updatedAt: Date.now(),
+  };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('api:bridgeComposerStatus', bridgeComposerStatus);
+  }
+}
+
+function installBridgeRequestBlocker() {
+  if (!BRIDGE_RESOURCE_BLOCKING || bridgeRequestBlockerInstalled) return;
+  bridgeRequestBlockerInstalled = true;
+
+  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+    try {
+      if (!bridgeWindow || bridgeWindow.isDestroyed()) {
+        callback({});
+        return;
+      }
+      if (details.webContentsId !== bridgeWindow.webContents.id) {
+        callback({});
+        return;
+      }
+      if (BRIDGE_BLOCKED_RESOURCE_TYPES.has(details.resourceType)) {
+        callback({ cancel: true });
+        return;
+      }
+      callback({});
+    } catch {
+      callback({});
+    }
+  });
+}
+
+function buildBridgeFastModeScript() {
+  const maxTurns = BRIDGE_FAST_TURNS;
+  const cacheSize = BRIDGE_FAST_CACHE;
+  return `
+    (() => {
+      if (window.__codexBridgeFastModeInstalled) return;
+      window.__codexBridgeFastModeInstalled = true;
+      if (!window.__codexBridgeFastModeMeta) {
+        window.__codexBridgeFastModeMeta = {
+          installedAt: Date.now(),
+          lastConversationId: null,
+          lastConversationFetchAt: 0,
+          lastOriginalVisible: 0,
+          lastKeptVisible: 0,
+          lastUrl: '',
+          trimCount: 0,
+        };
+      }
+      const MAX_TURNS = ${JSON.stringify(maxTurns)};
+      const CACHE_SIZE = ${JSON.stringify(cacheSize)};
+      const responseCache = new Map();
+
+      const cacheGet = (key) => {
+        const hit = responseCache.get(key);
+        if (!hit) return null;
+        responseCache.delete(key);
+        responseCache.set(key, hit);
+        return hit;
+      };
+
+      const cachePut = (key, value) => {
+        responseCache.delete(key);
+        responseCache.set(key, value);
+        while (responseCache.size > CACHE_SIZE) {
+          const oldest = responseCache.keys().next().value;
+          if (!oldest) break;
+          responseCache.delete(oldest);
+        }
+      };
+
+      const isVisibleNode = (node) => {
+        const role = node?.message?.author?.role;
+        return role === 'user' || role === 'assistant';
+      };
+
+      const countVisibleMessages = (data) => {
+        if (!data || typeof data !== 'object' || !data.mapping || typeof data.mapping !== 'object' || !data.current_node) {
+          return 0;
+        }
+        const mapping = data.mapping;
+        const chain = [];
+        const visited = new Set();
+        let nid = data.current_node;
+        let guard = 0;
+        while (nid && mapping[nid] && !visited.has(nid) && guard < 6000) {
+          visited.add(nid);
+          chain.push(nid);
+          nid = mapping[nid]?.parent || null;
+          guard++;
+        }
+        chain.reverse();
+        let visible = 0;
+        for (const id of chain) {
+          if (isVisibleNode(mapping[id])) visible++;
+        }
+        return visible;
+      };
+
+      const trimConversationPayload = (data) => {
+        if (!data || typeof data !== 'object' || !data.mapping || typeof data.mapping !== 'object' || !data.current_node) {
+          return data;
+        }
+
+        const mapping = data.mapping;
+        const chain = [];
+        const visited = new Set();
+        let nid = data.current_node;
+        let guard = 0;
+
+        while (nid && mapping[nid] && !visited.has(nid) && guard < 6000) {
+          visited.add(nid);
+          chain.push(nid);
+          nid = mapping[nid]?.parent || null;
+          guard++;
+        }
+
+        chain.reverse();
+        if (chain.length === 0) return data;
+
+        const visibleLimit = Math.max(1, MAX_TURNS * 2);
+        let totalVisible = 0;
+        for (const id of chain) {
+          if (isVisibleNode(mapping[id])) totalVisible++;
+        }
+        if (totalVisible <= visibleLimit) return data;
+
+        let count = 0;
+        let cutoff = 0;
+        for (let i = chain.length - 1; i >= 0; i--) {
+          if (isVisibleNode(mapping[chain[i]])) {
+            count++;
+            if (count >= visibleLimit) {
+              cutoff = i;
+              break;
+            }
+          }
+        }
+
+        const keepSet = new Set();
+        for (let i = 0; i < cutoff; i++) {
+          if (!isVisibleNode(mapping[chain[i]])) keepSet.add(chain[i]);
+        }
+        for (let i = cutoff; i < chain.length; i++) {
+          keepSet.add(chain[i]);
+        }
+
+        const keptChain = chain.filter((id) => keepSet.has(id));
+        const trimmedMapping = {};
+        for (let i = 0; i < keptChain.length; i++) {
+          const id = keptChain[i];
+          const src = mapping[id];
+          if (!src) continue;
+          const node = JSON.parse(JSON.stringify(src));
+          node.parent = i > 0 ? keptChain[i - 1] : null;
+          node.children = i < keptChain.length - 1 ? [keptChain[i + 1]] : [];
+          trimmedMapping[id] = node;
+        }
+
+        return {
+          ...data,
+          mapping: trimmedMapping,
+          current_node: keptChain[keptChain.length - 1] || data.current_node,
+          root: keptChain[0] || data.root,
+        };
+      };
+
+      let baseFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+      const WRAPPED_FETCH_MARK = '__codexWrappedFetch';
+      if (typeof window.fetch === 'function' && window.fetch[WRAPPED_FETCH_MARK]) {
+        return;
+      }
+      const wrappedFetch = async (...args) => {
+        const input = args[0];
+        const init = args[1] || {};
+        const url = String(typeof input === 'string' ? input : (input && input.url) || '');
+        const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        let pathname = '';
+        try {
+          pathname = new URL(url, location.origin).pathname || '';
+        } catch {
+          pathname = '';
+        }
+        const isConversationGet = method === 'GET' && /^\\/backend-api\\/conversation\\/[^/]+$/.test(pathname);
+        if (!baseFetch) throw new Error('Base fetch unavailable');
+        if (!isConversationGet) return baseFetch(...args);
+
+        const cacheKey = method + ':' + url;
+        const cached = cacheGet(cacheKey);
+        if (cached) {
+          return new Response(cached.body, {
+            status: cached.status,
+            statusText: cached.statusText,
+            headers: new Headers(cached.headers),
+          });
+        }
+
+        const response = await baseFetch(...args);
+        if (!response.ok) return response;
+
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        if (!contentType.includes('application/json')) return response;
+
+        let payload = null;
+        try {
+          payload = await response.clone().json();
+        } catch {
+          return response;
+        }
+
+        const originalVisible = countVisibleMessages(payload);
+        const trimmed = trimConversationPayload(payload);
+        const keptVisible = countVisibleMessages(trimmed);
+        const body = JSON.stringify(trimmed);
+        const headers = new Headers(response.headers);
+        headers.set('content-type', 'application/json');
+        headers.delete('content-length');
+        headers.delete('content-encoding');
+
+        cachePut(cacheKey, {
+          body,
+          status: response.status,
+          statusText: response.statusText,
+          headers: Array.from(headers.entries()),
+        });
+
+        const conversationMatch = pathname.match(/^\\/backend-api\\/conversation\\/([^/]+)$/);
+        const conversationId = conversationMatch ? decodeURIComponent(conversationMatch[1]) : null;
+        const meta = window.__codexBridgeFastModeMeta || {};
+        meta.lastConversationId = conversationId;
+        meta.lastConversationFetchAt = Date.now();
+        meta.lastOriginalVisible = originalVisible;
+        meta.lastKeptVisible = keptVisible;
+        meta.lastUrl = url;
+        meta.trimCount = Number(meta.trimCount || 0) + (keptVisible < originalVisible ? 1 : 0);
+        window.__codexBridgeFastModeMeta = meta;
+
+        return new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      };
+
+      wrappedFetch[WRAPPED_FETCH_MARK] = true;
+      window.fetch = wrappedFetch;
+    })();
+  `;
+}
+
+async function installBridgeFastMode(win) {
+  if (!BRIDGE_FAST_MODE || !win || win.isDestroyed()) return;
+  try {
+    await win.webContents.executeJavaScript(buildBridgeFastModeScript(), true);
+  } catch (error) {
+    console.warn('Bridge fast mode injection failed:', error);
+  }
+}
 
 function extractFileId(value) {
   if (!value) return null;
@@ -113,6 +400,8 @@ async function ensureBridgeWindow() {
     return bridgeWindow;
   }
 
+  installBridgeRequestBlocker();
+
   bridgeWindow = new BrowserWindow({
     show: shouldShowBridgeWindow(),
     width: 1200,
@@ -122,9 +411,27 @@ async function ensureBridgeWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
+      backgroundThrottling: false,
+      preload: path.join(__dirname, 'bridge-preload.cjs'),
+      additionalArguments: [
+        `--bridge-fast-mode=${BRIDGE_FAST_MODE ? '1' : '0'}`,
+        `--bridge-fast-turns=${String(BRIDGE_FAST_TURNS)}`,
+        `--bridge-fast-cache=${String(BRIDGE_FAST_CACHE)}`,
+      ],
     },
   });
+
+  if (!shouldShowBridgeWindow()) {
+    bridgeWindow.setSkipTaskbar(true);
+  }
+
   bridgeWindow.webContents.setUserAgent(ensureAppUserAgent());
+  bridgeWindow.webContents.setAudioMuted(true);
+  bridgeWindow.webContents.on('did-finish-load', () => {
+    installBridgeFastMode(bridgeWindow).catch((error) => {
+      console.warn('Bridge fast mode post-load install failed:', error);
+    });
+  });
 
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Bridge window load timeout')), 30000);
@@ -134,6 +441,11 @@ async function ensureBridgeWindow() {
     });
     bridgeWindow.webContents.once('did-fail-load', (_event, code, desc) => {
       clearTimeout(timeout);
+      // Navigation handoff commonly triggers ERR_ABORTED (-3) when a newer loadURL supersedes this one.
+      if (isAbortedNavigationError(code)) {
+        resolve();
+        return;
+      }
       reject(new Error(`Bridge window failed to load (${code}): ${desc}`));
     });
     bridgeWindow.loadURL('https://chatgpt.com/').catch(reject);
@@ -141,41 +453,57 @@ async function ensureBridgeWindow() {
 
   bridgeWindow.on('closed', () => {
     bridgeWindow = null;
+    publishBridgeComposerStatus({
+      state: 'idle',
+      ready: false,
+      reason: 'Bridge window closed',
+      conversationId: null,
+    });
   });
   return bridgeWindow;
 }
 
 async function navigateBridgeTo(url) {
   const win = await ensureBridgeWindow();
+  const homeUrl = 'https://chatgpt.com/';
+  const targetUrl = url || homeUrl;
   const currentUrl = win.webContents.getURL();
-  if (currentUrl && normalizeChatgptUrl(currentUrl) === normalizeChatgptUrl(url)) {
+
+  if (currentUrl && normalizeChatgptUrl(currentUrl) === normalizeChatgptUrl(targetUrl)) {
+    await installBridgeFastMode(win);
     return win;
   }
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Bridge navigation timeout')), 30000);
-    win.webContents.once('did-finish-load', () => {
-      clearTimeout(timeout);
-      resolve();
+
+  try {
+    win.loadURL(targetUrl).catch((err) => {
+      if (isAbortedNavigationError(err)) return;
+      console.warn('Bridge navigation failed:', err);
     });
-    win.webContents.once('did-fail-load', (_event, code, desc) => {
-      clearTimeout(timeout);
-      reject(new Error(`Bridge navigation failed (${code}): ${desc}`));
-    });
-    win.loadURL(url).catch(reject);
-  });
+  } catch (err) {
+    if (!isAbortedNavigationError(err)) {
+      throw err;
+    }
+  }
+
+  // We don't wait for did-finish-load, the composer poller is faster
+  await sleep(100);
+  await installBridgeFastMode(win);
   return win;
 }
 
 async function waitForBridgeComposer(win, conversationId) {
   const expectedPath = conversationId ? `/c/${conversationId}` : '/';
   const deadline = Date.now() + 30000;
+  const startTime = Date.now();
+  const expectedVisibleLimit = Math.max(1, BRIDGE_FAST_TURNS * 2);
   let lastState = null;
+  let stableCounter = 0;
 
   while (Date.now() < deadline) {
     lastState = await win.webContents.executeJavaScript(
       `
         (() => {
-          const composer =
+          const getComposer = () =>
             document.querySelector('#prompt-textarea[contenteditable="true"]') ||
             document.querySelector('textarea#prompt-textarea') ||
             document.querySelector('div[contenteditable="true"][id="prompt-textarea"]') ||
@@ -185,27 +513,209 @@ async function waitForBridgeComposer(win, conversationId) {
             document.querySelector('button[data-testid="send-button"]') ||
             document.querySelector('button[aria-label="Send prompt"]') ||
             document.querySelector('button[aria-label*="Send"]');
+          
+          const composer = getComposer();
+          const loadingIndicators = document.querySelectorAll('[role="progressbar"], [aria-busy="true"], [data-testid*="loading"]').length;
+          const messageCount = document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]').length;
           return {
-            href: location.href,
             path: location.pathname,
-            readyState: document.readyState,
             composerFound: !!composer,
-            sendButtonFound: !!sendBtn,
+            composerVisible: composer ? (composer.offsetWidth > 0 && composer.offsetHeight > 0) : false,
+            composerEnabled: composer ? !composer.hasAttribute('disabled') : false,
+            messageCount,
+            loadingIndicators,
+            fastModeInstalled: !!window.__codexBridgeFastModeInstalled,
+            fastModeMeta: window.__codexBridgeFastModeMeta || null,
           };
         })();
       `,
       true
     );
 
-    const pathOk = conversationId ? lastState?.path === expectedPath : lastState?.path === '/';
-    if (pathOk && lastState?.composerFound) {
-      await sleep(350);
-      return lastState;
+    const normalizedPath = String(lastState?.path || '').replace(/\/+$/, '');
+    const normalizedExpectedPath = expectedPath.replace(/\/+$/, '');
+    const pathOk = conversationId ? normalizedPath === normalizedExpectedPath : true;
+    const loadingIdle = Number(lastState?.loadingIndicators || 0) === 0;
+    const hasMessagesForConversation = !conversationId || Number(lastState?.messageCount || 0) > 0;
+    const fastInstalled = !!lastState?.fastModeInstalled;
+    const fastMeta = lastState?.fastModeMeta || null;
+    const trimFreshForConversation =
+      !conversationId || (
+        fastMeta &&
+        fastMeta.lastConversationId === conversationId &&
+        (Date.now() - Number(fastMeta.lastConversationFetchAt || 0)) < 20000
+      );
+    const trimWorked =
+      !conversationId || (
+        !!fastMeta && (
+          Number(fastMeta.lastOriginalVisible || 0) <= expectedVisibleLimit ||
+          Number(fastMeta.lastKeptVisible || 0) <= expectedVisibleLimit
+        )
+      );
+    const trimmedConversationReady = !conversationId || (fastInstalled && trimFreshForConversation && trimWorked);
+    
+    if (
+      pathOk &&
+      lastState?.composerFound &&
+      lastState?.composerVisible &&
+      lastState?.composerEnabled &&
+      loadingIdle &&
+      hasMessagesForConversation &&
+      trimmedConversationReady
+    ) {
+      stableCounter++;
+      if (stableCounter >= 4 && (Date.now() - startTime) >= 500) {
+        return lastState;
+      }
+    } else {
+      stableCounter = 0;
     }
-    await sleep(100);
+    await sleep(80);
   }
 
-  throw new Error(`Bridge did not settle on ${expectedPath}: ${JSON.stringify(lastState)}`);
+  throw new Error(`Bridge did not find composer on ${expectedPath}. Path: ${lastState?.path}`);
+}
+
+async function prewarmBridgeConversation(conversationId) {
+  const normalizedConversationId = conversationId || null;
+  const warmToken = ++bridgeWarmRequestToken;
+  publishBridgeComposerStatus({
+    conversationId: normalizedConversationId,
+    state: 'warming',
+    ready: false,
+    reason: '',
+  });
+
+  const targetUrl = normalizedConversationId
+    ? `https://chatgpt.com/c/${encodeURIComponent(normalizedConversationId)}`
+    : 'https://chatgpt.com/';
+
+  try {
+    const win = await navigateBridgeTo(targetUrl);
+    await waitForBridgeComposer(win, normalizedConversationId);
+    if (warmToken !== bridgeWarmRequestToken) {
+      return { success: false, superseded: true };
+    }
+    publishBridgeComposerStatus({
+      conversationId: normalizedConversationId,
+      state: 'ready',
+      ready: true,
+      reason: '',
+    });
+    return { success: true };
+  } catch (error) {
+    if (warmToken !== bridgeWarmRequestToken) {
+      return { success: false, superseded: true };
+    }
+    if (isAbortedNavigationError(error)) {
+      return { success: false, superseded: true };
+    }
+    const reason = String(error?.message || error || 'Bridge warm failed');
+    publishBridgeComposerStatus({
+      conversationId: normalizedConversationId,
+      state: 'error',
+      ready: false,
+      reason,
+    });
+    return { success: false, error: reason };
+  }
+}
+
+async function monitorBridgeGeneration(conversationId) {
+  if (!bridgeWindow || bridgeWindow.isDestroyed()) return;
+  const win = bridgeWindow;
+  const token = ++bridgeGenerationMonitorToken;
+  const expectedPath = conversationId ? `/c/${conversationId}` : null;
+  const deadline = Date.now() + 180000;
+  let sawGenerating = false;
+  let idlePasses = 0;
+
+  while (
+    token === bridgeGenerationMonitorToken &&
+    Date.now() < deadline &&
+    win &&
+    !win.isDestroyed()
+  ) {
+    let snapshot = null;
+    try {
+      snapshot = await win.webContents.executeJavaScript(
+        `
+          (() => {
+            const getComposer = () =>
+              document.querySelector('#prompt-textarea[contenteditable="true"]') ||
+              document.querySelector('textarea#prompt-textarea') ||
+              document.querySelector('div[contenteditable="true"][id="prompt-textarea"]') ||
+              document.querySelector('textarea[placeholder*="ask" i], textarea[placeholder*="message" i]');
+            const sendBtn =
+              document.querySelector('#composer-submit-button') ||
+              document.querySelector('button[data-testid="send-button"]') ||
+              document.querySelector('button[aria-label="Send prompt"]') ||
+              document.querySelector('button[aria-label*="Send"]');
+            const stopBtn =
+              document.querySelector('button[data-testid="stop-button"]') ||
+              document.querySelector('button[aria-label="Stop generating"]') ||
+              document.querySelector('button[aria-label*="Stop"]');
+
+            const composer = getComposer();
+            const sendDisabled = !!sendBtn && (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true');
+            const composerEnabled = composer ? !composer.hasAttribute('disabled') : false;
+
+            return {
+              path: location.pathname,
+              composerFound: !!composer,
+              composerEnabled,
+              sendDisabled,
+              stopVisible: !!stopBtn,
+            };
+          })();
+        `,
+        true
+      );
+    } catch {
+      break;
+    }
+
+    const path = String(snapshot?.path || '').replace(/\/+$/, '');
+    const pathOk = expectedPath ? path === expectedPath : true;
+    if (!pathOk) {
+      await sleep(200);
+      continue;
+    }
+
+    const generating = !!snapshot?.stopVisible || (!!snapshot?.composerFound && !!snapshot?.sendDisabled);
+    if (generating) {
+      sawGenerating = true;
+      idlePasses = 0;
+      publishBridgeComposerStatus({
+        conversationId: conversationId || null,
+        state: 'thinking',
+        ready: false,
+        reason: '',
+      });
+    } else {
+      idlePasses += 1;
+      if (sawGenerating || idlePasses >= 4) {
+        publishBridgeComposerStatus({
+          conversationId: conversationId || null,
+          state: 'ready',
+          ready: true,
+          reason: '',
+        });
+        return;
+      }
+    }
+
+    await sleep(250);
+  }
+
+  if (token === bridgeGenerationMonitorToken) {
+    publishBridgeComposerStatus({
+      conversationId: conversationId || null,
+      state: 'ready',
+      ready: true,
+      reason: '',
+    });
+  }
 }
 
 async function sendConversationViaUiAutomation({ conversationId, content }) {
@@ -214,12 +724,15 @@ async function sendConversationViaUiAutomation({ conversationId, content }) {
     : 'https://chatgpt.com/';
   const win = await navigateBridgeTo(targetUrl);
   const prompt = String(content || '');
+  
   if (shouldShowBridgeWindow()) {
     win.show();
     win.focus();
   }
   win.webContents.focus();
-  const settledState = await waitForBridgeComposer(win, conversationId);
+  
+  await waitForBridgeComposer(win, conversationId || null);
+  
   const setup = await win.webContents.executeJavaScript(
     `
       (() => {
@@ -232,84 +745,24 @@ async function sendConversationViaUiAutomation({ conversationId, content }) {
         const composer = getComposer();
         if (!composer) return { ok: false, reason: 'Composer not found' };
 
-        if (!window.__codexOriginalFetch) {
-          window.__codexOriginalFetch = window.fetch.bind(window);
-          window.fetch = async (...args) => {
-            const input = args[0];
-            const init = args[1] || {};
-            const url = String(typeof input === 'string' ? input : (input && input.url) || '');
-            const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-            const isConversationPost = method === 'POST' && url.includes('/backend-api/conversation');
-            const bodyStr = typeof init.body === 'string' ? init.body : '';
-            try {
-              const response = await window.__codexOriginalFetch(...args);
-              if (isConversationPost) {
-                let responseText = '';
-                try {
-                  responseText = await response.clone().text();
-                } catch {}
-                window.__codexSendEvents.push({
-                  time: Date.now(),
-                  ok: response.ok,
-                  status: response.status,
-                  statusText: response.statusText,
-                  body: String(responseText || '').slice(0, 1000),
-                  requestBody: bodyStr.slice(0, 1000),
-                });
-              }
-              return response;
-            } catch (error) {
-              if (isConversationPost) {
-                window.__codexSendEvents.push({
-                  time: Date.now(),
-                  ok: false,
-                  status: 0,
-                  statusText: 'fetch_throw',
-                  body: String(error && error.message ? error.message : error || ''),
-                  requestBody: bodyStr.slice(0, 1000),
-                });
-              }
-              throw error;
-            }
-          };
-        }
-        if (!Array.isArray(window.__codexSendEvents)) window.__codexSendEvents = [];
-        const startEventCount = window.__codexSendEvents.length;
+        const startUserCount = document.querySelectorAll('[data-message-author-role="user"]').length;
+        const startAssistantCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
 
         composer.focus();
+        // Clear previous content
         if ((composer.tagName || '').toUpperCase() === 'TEXTAREA') {
           composer.value = '';
           composer.dispatchEvent(new Event('input', { bubbles: true }));
-          composer.dispatchEvent(new Event('change', { bubbles: true }));
         } else {
-          try {
-            const sel = window.getSelection();
-            const range = document.createRange();
-            range.selectNodeContents(composer);
-            sel.removeAllRanges();
-            sel.addRange(range);
-            document.execCommand('delete');
-          } catch {}
-          composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+          composer.innerHTML = '';
+          composer.dispatchEvent(new InputEvent('input', { bubbles: true }));
         }
-        const sendBtn =
-          document.querySelector('#composer-submit-button') ||
-          document.querySelector('button[data-testid="send-button"]') ||
-          document.querySelector('button[aria-label="Send prompt"]') ||
-          document.querySelector('button[aria-label*="Send"]');
+
         return {
           ok: true,
-          startEventCount,
-          settledState: ${JSON.stringify(null)},
+          startUserCount,
+          startAssistantCount,
           url: location.href,
-          composerTag: composer.tagName,
-          composerClass: composer.className,
-          composerText: (composer.value || composer.textContent || '').slice(0, 200),
-          activeTag: document.activeElement ? document.activeElement.tagName : '',
-          activeId: document.activeElement ? document.activeElement.id : '',
-          sendButtonFound: !!sendBtn,
-          sendButtonDisabled: sendBtn ? !!sendBtn.disabled : null,
-          sendButtonAriaDisabled: sendBtn ? sendBtn.getAttribute('aria-disabled') : null,
         };
       })();
     `,
@@ -320,43 +773,9 @@ async function sendConversationViaUiAutomation({ conversationId, content }) {
     return { ok: false, status: 0, statusText: 'ui_send_failed', bodyText: String(setup?.reason || 'Composer setup failed') };
   }
 
+  // Insert the text and click send
   await win.webContents.insertText(prompt);
-  await sleep(120);
-
-  const afterInsert = await win.webContents.executeJavaScript(
-    `
-      (() => {
-        const composer =
-          document.querySelector('#prompt-textarea[contenteditable="true"]') ||
-          document.querySelector('textarea#prompt-textarea') ||
-          document.querySelector('div[contenteditable="true"][id="prompt-textarea"]');
-        const sendBtn =
-          document.querySelector('#composer-submit-button') ||
-          document.querySelector('button[data-testid="send-button"]') ||
-          document.querySelector('button[aria-label="Send prompt"]') ||
-          document.querySelector('button[aria-label*="Send"]');
-        return {
-          url: location.href,
-          composerFound: !!composer,
-          composerTag: composer ? composer.tagName : '',
-          composerText: composer ? String(composer.value || composer.textContent || '').slice(0, 200) : '',
-          composerHtml: composer ? String(composer.innerHTML || '').slice(0, 300) : '',
-          activeTag: document.activeElement ? document.activeElement.tagName : '',
-          activeId: document.activeElement ? document.activeElement.id : '',
-          sendButtonFound: !!sendBtn,
-          sendButtonDisabled: sendBtn ? !!sendBtn.disabled : null,
-          sendButtonAriaDisabled: sendBtn ? sendBtn.getAttribute('aria-disabled') : null,
-        };
-      })();
-    `,
-    true
-  );
-  console.info('UI send composer state', {
-    settledState,
-    setup,
-    afterInsert,
-    promptPreview: prompt.slice(0, 120),
-  });
+  await sleep(100);
 
   const clickResult = await win.webContents.executeJavaScript(
     `
@@ -368,19 +787,10 @@ async function sendConversationViaUiAutomation({ conversationId, content }) {
           document.querySelector('button[aria-label*="Send"]');
         if (!sendBtn) return { ok: false, reason: 'Send button not found' };
         if (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {
-          return {
-            ok: false,
-            reason: 'Send button disabled',
-            disabled: !!sendBtn.disabled,
-            ariaDisabled: sendBtn.getAttribute('aria-disabled'),
-          };
+          return { ok: false, reason: 'Send button disabled' };
         }
         sendBtn.click();
-        return {
-          ok: true,
-          disabled: !!sendBtn.disabled,
-          ariaDisabled: sendBtn.getAttribute('aria-disabled'),
-        };
+        return { ok: true };
       })();
     `,
     true
@@ -390,185 +800,70 @@ async function sendConversationViaUiAutomation({ conversationId, content }) {
     return { ok: false, status: 0, statusText: 'ui_send_failed', bodyText: String(clickResult?.reason || 'Could not click send') };
   }
 
-  const promptMarker = prompt.trim().slice(0, 80);
-  const startEventCount = Number(setup.startEventCount || 0);
-  const deadline = Date.now() + 20000;
-  while (Date.now() < deadline) {
-    const eventEnvelope = await win.webContents.executeJavaScript(
+  // Primary success detection is DOM-level submit acceptance.
+  // Request observers are best-effort only and can miss due page script timing.
+  const acceptDeadline = Date.now() + 7000;
+  while (Date.now() < acceptDeadline) {
+    const submitObserved = await win.webContents.executeJavaScript(
       `
         (() => {
-          const events = Array.isArray(window.__codexSendEvents) ? window.__codexSendEvents : [];
-          if (events.length <= ${startEventCount}) return null;
-          const fresh = events.slice(${startEventCount});
-          const marker = ${JSON.stringify(promptMarker)};
-          const found = [...fresh].reverse().find((e) => {
-            if (!e || typeof e !== 'object') return false;
-            const body = String(e.requestBody || '');
-            const looksLikeSend = body.includes('"action":"next"') || body.includes('"action": "next"');
-            const hasMarker = !marker || body.includes(marker);
-            return looksLikeSend && hasMarker;
-          });
+          const getComposer = () =>
+            document.querySelector('#prompt-textarea[contenteditable="true"]') ||
+            document.querySelector('textarea#prompt-textarea') ||
+            document.querySelector('div[contenteditable="true"][id="prompt-textarea"]') ||
+            document.querySelector('textarea[placeholder*="ask" i], textarea[placeholder*="message" i]');
+          const sendBtn =
+            document.querySelector('#composer-submit-button') ||
+            document.querySelector('button[data-testid="send-button"]') ||
+            document.querySelector('button[aria-label="Send prompt"]') ||
+            document.querySelector('button[aria-label*="Send"]');
+          const stopBtn =
+            document.querySelector('button[data-testid="stop-button"]') ||
+            document.querySelector('button[aria-label="Stop generating"]') ||
+            document.querySelector('button[aria-label*="Stop"]');
+
+          const composer = getComposer();
+          const composerEmpty = !composer
+            ? false
+            : ((composer.tagName || '').toUpperCase() === 'TEXTAREA'
+              ? String(composer.value || '').trim().length === 0
+              : String(composer.textContent || '').trim().length === 0);
+          const sendDisabled = !!sendBtn && (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true');
+          const userCount = document.querySelectorAll('[data-message-author-role="user"]').length;
+          const assistantCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+
+          const userAdvanced = userCount > ${Number(setup.startUserCount || 0)};
+          const assistantAdvanced = assistantCount > ${Number(setup.startAssistantCount || 0)};
+          const accepted =
+            !!stopBtn ||
+            userAdvanced ||
+            (composerEmpty && (sendDisabled || assistantAdvanced));
+
           return {
-            matched: found || null,
-            latest: fresh[fresh.length - 1] || null,
-            totalFresh: fresh.length,
+            accepted,
+            stopVisible: !!stopBtn,
+            userAdvanced,
+            assistantAdvanced,
+            composerEmpty,
+            sendDisabled,
           };
         })();
       `,
       true
     );
 
-    if (eventEnvelope && (eventEnvelope.matched || eventEnvelope.latest)) {
-      const event = eventEnvelope.matched || eventEnvelope.latest;
-      const currentUrl = win.webContents.getURL();
-      console.info('UI send observed conversation request', {
-        url: currentUrl,
-        matched: !!eventEnvelope.matched,
-        totalFresh: eventEnvelope.totalFresh,
-        status: Number(event?.status || 0),
-        ok: !!event?.ok,
-        requestBodyPreview: String(event?.requestBody || '').slice(0, 200),
-        responsePreview: String(event?.body || '').slice(0, 200),
-      });
+    if (submitObserved?.accepted) {
       return {
-        ok: !!eventEnvelope.matched && !!event.ok,
-        status: Number(event.status || 0),
-        statusText: String(event.statusText || (eventEnvelope.matched ? 'ui_sent' : 'ui_unmatched_request')),
-        bodyText: String(event.body || ''),
+        ok: true,
+        status: 202,
+        statusText: submitObserved.stopVisible ? 'ui_sent_generating' : 'ui_sent_accepted',
+        bodyText: '',
       };
     }
-    await sleep(100);
+    await sleep(120);
   }
 
-  return { ok: false, status: 0, statusText: 'ui_send_failed', bodyText: 'No conversation request observed after send action' };
-}
-
-async function sendConversationViaBridge(payload) {
-  const win = await ensureBridgeWindow();
-  const payloadJson = JSON.stringify(payload);
-  const script = `
-    (async () => {
-      try {
-        const response = await fetch('/backend-api/conversation', {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'accept': 'application/json, text/plain, */*',
-            'content-type': 'application/json'
-          },
-          body: ${JSON.stringify(payloadJson)}
-        });
-        const bodyText = await response.text();
-        return {
-          ok: response.ok,
-          status: response.status,
-          statusText: response.statusText,
-          bodyText
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          status: 0,
-          statusText: 'bridge_fetch_failed',
-          bodyText: String(error && error.message ? error.message : error || '')
-        };
-      }
-    })();
-  `;
-  return await win.webContents.executeJavaScript(script, true);
-}
-
-async function createUploadSlot(fileName, fileSize) {
-  const response = await auth.fetchWithAuth('https://chatgpt.com/backend-api/files', {
-    method: 'POST',
-    body: JSON.stringify({
-      file_name: fileName,
-      file_size: fileSize,
-      use_case: 'multimodal',
-      timezone_offset_min: new Date().getTimezoneOffset(),
-      reset_rate_limits: false,
-    }),
-    headers: {
-      Accept: 'application/json, text/plain, */*',
-    },
-  });
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw new Error(`File slot create failed (${response.status}): ${errorText.slice(0, 300)}`);
-  }
-  const payload = await response.json();
-  if (!payload?.file_id || !payload?.upload_url) {
-    throw new Error('File slot response missing file_id/upload_url');
-  }
-  return payload;
-}
-
-async function uploadToSignedUrl(uploadUrl, buffer, mimeType = 'application/octet-stream') {
-  const response = await session.defaultSession.fetch(uploadUrl, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': mimeType,
-      'x-ms-blob-type': 'BlockBlob',
-      'x-ms-version': '2020-04-08',
-      Accept: '*/*',
-    },
-    body: buffer,
-  });
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw new Error(`Signed upload failed (${response.status}): ${errorText.slice(0, 300)}`);
-  }
-}
-
-async function finalizeUploadedFile(fileId) {
-  const response = await auth.fetchWithAuth(`https://chatgpt.com/backend-api/files/${encodeURIComponent(fileId)}/uploaded`, {
-    method: 'POST',
-    body: JSON.stringify({}),
-    headers: {
-      Accept: 'application/json, text/plain, */*',
-    },
-  });
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw new Error(`File finalize failed (${response.status}): ${errorText.slice(0, 300)}`);
-  }
-}
-
-async function uploadAttachment(attachment) {
-  if (!attachment?.dataUrl || typeof attachment.dataUrl !== 'string') {
-    throw new Error('Attachment is missing data URL');
-  }
-  const parsed = parseDataUrl(attachment.dataUrl);
-  if (!parsed) throw new Error('Invalid attachment data URL');
-
-  const mimeType = attachment.mimeType || parsed.mime || 'application/octet-stream';
-  const fileName = attachment.name || `upload-${Date.now()}`;
-  const sizeBytes = parsed.buffer.length;
-
-  const slot = await createUploadSlot(fileName, sizeBytes);
-  await uploadToSignedUrl(slot.upload_url, parsed.buffer, mimeType);
-  await finalizeUploadedFile(slot.file_id);
-
-  let width = undefined;
-  let height = undefined;
-  if (mimeType.startsWith('image/')) {
-    const image = nativeImage.createFromBuffer(parsed.buffer);
-    if (!image.isEmpty()) {
-      const size = image.getSize();
-      width = size.width;
-      height = size.height;
-    }
-  }
-
-  return {
-    fileId: slot.file_id,
-    mimeType,
-    name: fileName,
-    sizeBytes,
-    width,
-    height,
-    isImage: mimeType.startsWith('image/'),
-  };
+  return { ok: false, status: 0, statusText: 'ui_send_failed', bodyText: 'Send click was not accepted by bridge UI' };
 }
 
 function parseBackendErrorDetail(rawText) {
@@ -986,6 +1281,17 @@ function setupIpc() {
     return getLinearMessages(conversationId);
   });
 
+  ipcMain.handle('api:prewarmConversation', async (event, payload) => {
+    const conversationId = typeof payload === 'string'
+      ? payload
+      : (payload?.conversationId || null);
+    return prewarmBridgeConversation(conversationId);
+  });
+
+  ipcMain.handle('api:getBridgeComposerStatus', async () => {
+    return bridgeComposerStatus;
+  });
+
   ipcMain.handle('db:searchMessages', async (event, query) => {
     return db.searchMessages(query);
   });
@@ -1126,139 +1432,58 @@ function setupIpc() {
     }
   });
 
-  ipcMain.handle('api:sendMessage', async (event, { conversationId, content, model, parentMessageId, image, files }) => {
+  ipcMain.handle('api:sendMessage', async (event, { conversationId, content, image, files }) => {
     try {
-      const uploaded = [];
       const fileList = Array.isArray(files) ? files : [];
-      for (const file of fileList) {
-        uploaded.push(await uploadAttachment(file));
-      }
-      if (image && typeof image === 'string') {
-        uploaded.push(await uploadAttachment({
-          name: 'pasted-image.png',
-          mimeType: 'image/png',
-          dataUrl: image,
-        }));
+      if (image || fileList.length > 0) {
+        throw new Error('Bridge-only send currently supports text prompts only.');
       }
 
-      const imageParts = uploaded
-        .filter((f) => f.isImage)
-        .map((f) => ({
-          asset_pointer: `file-service://${f.fileId}`,
-          content_type: 'image_asset_pointer',
-          width: f.width || 0,
-          height: f.height || 0,
-          size_bytes: f.sizeBytes,
-        }));
+      const prompt = String(content || '');
+      if (!prompt.trim()) {
+        throw new Error('Cannot send an empty message.');
+      }
 
-      const attachments = uploaded.map((f) => {
-        const base = {
-          id: f.fileId,
-          mime_type: f.mimeType,
-          name: f.name,
-          size: f.sizeBytes,
-        };
-        return f.isImage
-          ? { ...base, width: f.width || 0, height: f.height || 0 }
-          : base;
+      const warmResult = await prewarmBridgeConversation(conversationId || null);
+      if (!warmResult?.success) {
+        throw new Error(bridgeComposerStatus.reason || 'Chat is not ready for sending yet.');
+      }
+
+      publishBridgeComposerStatus({
+        conversationId: conversationId || null,
+        state: 'sending',
+        ready: false,
+        reason: '',
       });
 
-      const messageId = require('crypto').randomUUID();
-      const conv = conversationId ? db.getConversation(conversationId) : null;
-      const effectiveParentId = conv?.current_node_id || parentMessageId || require('crypto').randomUUID();
-      const payload = {
-        action: 'next',
-        messages: [
-          {
-            id: messageId,
-            author: { role: 'user' },
-            content: {
-              content_type: imageParts.length > 0 ? 'multimodal_text' : 'text',
-              parts: imageParts.length > 0 ? [...imageParts, content || ''] : [content || '']
-            },
-            metadata: attachments.length > 0
-              ? {
-                  selected_all_github_repos: false,
-                  selected_github_repos: [],
-                  attachments,
-                  system_hints: [],
-                }
-              : {
-                  selected_all_github_repos: false,
-                  selected_github_repos: [],
-                  serialization_metadata: { custom_symbol_offsets: [] },
-                  system_hints: [],
-                }
-          }
-        ],
-        parent_message_id: effectiveParentId,
-        model: model === 'auto' ? 'auto' : model,
-        timezone_offset_min: new Date().getTimezoneOffset(),
-        history_and_training_disabled: false,
-        conversation_id: conversationId || undefined
-      };
+      const uiResult = await sendConversationViaUiAutomation({
+        conversationId: conversationId || null,
+        content: prompt,
+      });
 
-      if (uploaded.length === 0 && typeof content === 'string' && content.trim()) {
-        let uiHardFailure = null;
-        try {
-          const uiResult = await sendConversationViaUiAutomation({ conversationId, content });
-          if (uiResult?.ok) {
-            console.info('Message send used UI automation path', { statusText: uiResult.statusText });
-            return { success: true };
-          }
-          console.warn('UI automation send path did not succeed:', uiResult);
-          if (uiResult && typeof uiResult.status === 'number' && uiResult.status >= 400) {
-            const detail = parseBackendErrorDetail(String(uiResult.bodyText || ''));
-            const error = new Error(
-              detail
-                ? `Failed to send message (${uiResult.status}): ${detail}`
-                : `Failed to send message (${uiResult.status})`
-            );
-            error.statusCode = uiResult.status;
-            error.apiDetail = detail;
-            uiHardFailure = error;
-          }
-        } catch (uiError) {
-          console.warn('UI automation send path failed, falling back to API paths:', uiError);
-        }
-        if (uiHardFailure) throw uiHardFailure;
+      if (!uiResult?.ok) {
+        const detail = parseBackendErrorDetail(String(uiResult?.bodyText || uiResult?.statusText || ''));
+        throw new Error(detail || 'Failed to send message via bridge window UI.');
       }
 
-      let sendResult = null;
-      try {
-        sendResult = await sendConversationViaBridge(payload);
-      } catch (bridgeError) {
-        console.warn('Bridge send path failed, falling back to main-process fetch:', bridgeError);
-      }
+      publishBridgeComposerStatus({
+        conversationId: conversationId || null,
+        state: 'thinking',
+        ready: false,
+        reason: '',
+      });
+      monitorBridgeGeneration(conversationId || null).catch((error) => {
+        console.warn('Bridge generation monitor failed:', error);
+      });
 
-      if (!sendResult || sendResult.status === 0) {
-        const fallbackResponse = await auth.fetchWithAuth('https://chatgpt.com/backend-api/conversation', {
-          method: 'POST',
-          body: JSON.stringify(payload)
-        });
-        sendResult = {
-          ok: fallbackResponse.ok,
-          status: fallbackResponse.status,
-          statusText: fallbackResponse.statusText,
-          bodyText: await fallbackResponse.text().catch(() => ''),
-        };
-      }
-
-      if (!sendResult.ok) {
-        const errText = sendResult.bodyText || '';
-        const detail = parseBackendErrorDetail(errText);
-        console.error('API Send Error:', { status: sendResult.status, statusText: sendResult.statusText, detail: detail || errText });
-        const error = new Error(
-          detail
-            ? `Failed to send message (${sendResult.status}): ${detail}`
-            : `Failed to send message (${sendResult.status})`
-        );
-        error.statusCode = sendResult.status;
-        error.apiDetail = detail;
-        throw error;
-      }
       return { success: true };
     } catch (error) {
+      publishBridgeComposerStatus({
+        conversationId: conversationId || null,
+        state: 'error',
+        ready: false,
+        reason: String(error?.message || error || 'Send failed'),
+      });
       console.error('Send message failed:', error);
       throw error;
     }
@@ -1316,6 +1541,7 @@ app.whenReady().then(() => {
   db = new ChatDatabase();
   setupIpc();
   createWindow();
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

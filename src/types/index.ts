@@ -19,6 +19,7 @@ export interface Message {
 export interface ElectronAPI {
   invoke: (channel: string, ...args: any[]) => Promise<any>;
   onCacheProgress?: (func: (...args: any[]) => void) => void;
+  onBridgeComposerStatus?: (func: (...args: any[]) => void) => (() => void) | void;
 }
 
 declare global {

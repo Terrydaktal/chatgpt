@@ -13,6 +13,7 @@ import './index.css';
 const escapeRegExp = (string: string) => {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const getMessagePreview = (content: string) => {
   const normalized = content
@@ -98,6 +99,13 @@ const isNavigableMessage = (msg: Message) =>
 type ThinkingPart = Pick<Message, 'id' | 'role' | 'content'>;
 type DisplayMessage = Message & { thinkingParts?: ThinkingPart[] };
 type CitationEntry = { id: string; url?: string; title?: string };
+type BridgeComposerStatus = {
+  conversationId: string | null;
+  state: string;
+  ready: boolean;
+  reason?: string;
+  updatedAt?: number;
+};
 
 const formatSendError = (error: unknown) => {
   const message = typeof error === 'string'
@@ -499,15 +507,34 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
 });
 
 const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationRegistry }: { msg: DisplayMessage, highlightQuery?: string, isTarget?: boolean, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
+  const hasThinking = msg.role === 'assistant' && !!msg.thinkingParts && msg.thinkingParts.length > 0;
+  const [thinkingOpen, setThinkingOpen] = useState(false);
+
+  useEffect(() => {
+    setThinkingOpen(false);
+  }, [msg.id]);
+
   return (
     <div className={`message-row ${msg.role} ${isTarget ? 'highlight-target' : ''}`} data-message-id={msg.id}>
       <div className="message-content">
-        <div className="role-label">{msg.role === 'user' ? 'You' : 'ChatGPT'}</div>
-        {msg.role === 'assistant' && msg.thinkingParts && msg.thinkingParts.length > 0 ? (
-          <details className="thinking-box">
-            <summary>Thinking</summary>
+        <div className="message-header">
+          <div className="role-label">{msg.role === 'user' ? 'You' : 'ChatGPT'}</div>
+          {hasThinking ? (
+            <button
+              type="button"
+              className={`thinking-inline-toggle ${thinkingOpen ? 'open' : ''}`}
+              onClick={() => setThinkingOpen((prev) => !prev)}
+              aria-expanded={thinkingOpen}
+            >
+              <span className="thinking-chevron" aria-hidden="true">▾</span>
+              <span>Thinking</span>
+            </button>
+          ) : null}
+        </div>
+        {hasThinking && thinkingOpen ? (
+          <div className="thinking-box-inline">
             <div className="thinking-content">
-              {msg.thinkingParts.map((part) => (
+              {msg.thinkingParts!.map((part) => (
                 <div key={part.id} className="thinking-item">
                   <div className="thinking-role">{part.role}</div>
                   <div className="markdown-body">
@@ -516,7 +543,7 @@ const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationR
                 </div>
               ))}
             </div>
-          </details>
+          </div>
         ) : null}
         <div className="markdown-body">
           <MarkdownMessage content={msg.content} highlightQuery={isTarget ? highlightQuery : undefined} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
@@ -558,6 +585,7 @@ function App() {
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [isReauthenticating, setIsReauthenticating] = useState(false);
+  const [bridgeComposerStatus, setBridgeComposerStatus] = useState<BridgeComposerStatus | null>(null);
 
   const [fontSize, setFontSize] = useState<number>(Number(localStorage.getItem('fontSize')) || 12);
   const [chatWidth, setChatWidth] = useState<number>(Number(localStorage.getItem('chatWidth')) || 800);
@@ -593,11 +621,28 @@ function App() {
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const activeConvIdRef = useRef<string | null>(localStorage.getItem('lastConvId'));
+  const bridgeComposerStatusRef = useRef<BridgeComposerStatus | null>(null);
   const hasScrolledToBottomRef = useRef<Record<string, boolean>>({});
   const virtuosoStateByConversationRef = useRef<Record<string, any>>({});
   const [restoreVirtuosoState, setRestoreVirtuosoState] = useState<any | null>(null);
   const displayMessages = useMemo(() => buildDisplayMessages(messages), [messages]);
   const citationRegistry = useMemo(() => buildCitationRegistry(messages), [messages]);
+  const isBridgeReadyForActiveConversation = useMemo(() => {
+    if (!bridgeComposerStatus?.ready) return false;
+    return (bridgeComposerStatus.conversationId || null) === (activeConvId || null);
+  }, [activeConvId, bridgeComposerStatus]);
+  const bridgeActivityLabel = useMemo(() => {
+    const status = bridgeComposerStatus;
+    if (!status) return '';
+    const sameConversation = (status.conversationId || null) === (activeConvId || null);
+    if (!sameConversation) return '';
+    if (status.state === 'sending') return 'Sending...';
+    if (status.state === 'thinking') return 'Thinking...';
+    if (status.state === 'warming') return 'Preparing chat...';
+    if (status.state === 'ready') return 'Ready';
+    if (status.state === 'error' && status.reason) return status.reason;
+    return '';
+  }, [activeConvId, bridgeComposerStatus]);
 
   const saveVirtuosoState = useCallback((conversationId: string | null) => {
     if (!conversationId || !virtuosoRef.current?.getState) return;
@@ -661,6 +706,8 @@ function App() {
     setRestoreVirtuosoState(virtuosoStateByConversationRef.current[id] || null);
     setActiveConvId(id);
     activeConvIdRef.current = id;
+    window.electronAPI.invoke('api:prewarmConversation', { conversationId: id })
+      .catch((error) => console.warn('Failed to prewarm bridge conversation', error));
     const localMsgs = await window.electronAPI.invoke('db:getMessages', id);
     setMessages(localMsgs);
     const shouldSyncNow = shouldSync || localMsgs.length === 0;
@@ -708,6 +755,11 @@ function App() {
 
   const handleSend = async () => {
     if (isSending || (!inputValue.trim() && !pastedImage && attachedFiles.length === 0)) return;
+    if (!isBridgeReadyForActiveConversation) {
+      setSendError('Bridge chat is still loading. Wait for the send button to turn green.');
+      return;
+    }
+    
     const outgoingContent = inputValue;
     const currentImage = pastedImage;
     const currentFiles = attachedFiles;
@@ -715,8 +767,29 @@ function App() {
       'Auto': 'auto', 'Instant 5.3': 'gpt-4o', 'Thinking 5.4 Standard': 'o1-mini',
       'Thinking 5.4 Extended': 'o1', 'Thinking 5.5 Standard': 'o3-mini', 'Thinking 5.5 Extended': 'o1',
     };
+    
     setSendError(null);
     setIsSending(true);
+
+    // Optimistically clear the input
+    setInputValue('');
+    setPastedImage(null);
+    setAttachedFiles([]);
+
+    // Create a temporary optimistic message
+    const tempId = `temp-${Date.now()}`;
+    const optimisticMsg: Message = {
+      id: tempId,
+      conversation_id: activeConvId || '',
+      role: 'user',
+      content: outgoingContent,
+      created_at: Date.now() / 1000,
+      parent_id: messages.length > 0 ? messages[messages.length - 1].id : undefined,
+    };
+    
+    // Add to list immediately
+    setMessages(prev => [...prev, optimisticMsg]);
+
     try {
       await window.electronAPI.invoke('api:sendMessage', {
         conversationId: activeConvId,
@@ -730,31 +803,66 @@ function App() {
           sizeBytes: f.sizeBytes,
         })),
       });
+
       if (activeConvId) {
-        const updatedMsgs = await window.electronAPI.invoke('api:syncMessages', { conversationId: activeConvId, force: true });
+        // Pull updates repeatedly while ChatGPT is thinking to mimic web streaming.
+        const syncDeadline = Date.now() + 120000;
+        let latestMsgs: Message[] = [];
+        let stableAssistantPasses = 0;
+        let lastAssistantFingerprint = '';
+
+        while (Date.now() < syncDeadline) {
+          const synced = await window.electronAPI.invoke('api:syncMessages', { conversationId: activeConvId, force: true });
+          latestMsgs = Array.isArray(synced) ? synced : [];
+          setMessages((prev) => {
+            if (JSON.stringify(prev) === JSON.stringify(latestMsgs)) return prev;
+            return latestMsgs;
+          });
+
+          const lastAssistant = [...latestMsgs].reverse().find((m) => m.role === 'assistant');
+          const assistantFingerprint = lastAssistant
+            ? `${lastAssistant.id}|${lastAssistant.content || ''}`
+            : '';
+          if (assistantFingerprint && assistantFingerprint === lastAssistantFingerprint) {
+            stableAssistantPasses += 1;
+          } else {
+            stableAssistantPasses = 0;
+            lastAssistantFingerprint = assistantFingerprint;
+          }
+
+          const bridgeState = bridgeComposerStatusRef.current?.state || '';
+          const stillGenerating = bridgeState === 'sending' || bridgeState === 'thinking' || bridgeState === 'warming';
+          if (!stillGenerating && stableAssistantPasses >= 2) break;
+
+          await sleep(350);
+        }
+
         const textNeedle = outgoingContent.trim();
-        const userMessageConfirmed = !textNeedle || updatedMsgs.some((m: Message) => {
+        const userMessageConfirmed = !textNeedle || latestMsgs.some((m: Message) => {
           if (m.role !== 'user') return false;
           return (m.content || '').includes(textNeedle);
         });
         if (!userMessageConfirmed) {
           setSendError('Send could not be verified in this chat. Your draft was kept so you can retry.');
-          setMessages(updatedMsgs);
-          return;
+          setInputValue(outgoingContent);
+          setPastedImage(currentImage);
+          setAttachedFiles(currentFiles);
         }
-        setInputValue('');
-        setPastedImage(null);
-        setAttachedFiles([]);
-        setMessages(updatedMsgs);
       } else {
-        setInputValue('');
-        setPastedImage(null);
-        setAttachedFiles([]);
+        // New conversation, need to refresh the list to find the new ID
         loadConversations();
       }
     } catch (error) {
       console.error('Failed to send message', error);
       setSendError(formatSendError(error));
+      
+      // Restore state on failure
+      setInputValue(outgoingContent);
+      setPastedImage(currentImage);
+      setAttachedFiles(currentFiles);
+      
+      // Remove the optimistic message
+      setMessages(prev => prev.filter(m => m.id !== tempId));
     } finally {
       setIsSending(false);
     }
@@ -1025,10 +1133,35 @@ function App() {
   }, [fullscreenImage, activeConvId]);
 
   useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    if (window.electronAPI.onBridgeComposerStatus) {
+      const maybeUnsub = window.electronAPI.onBridgeComposerStatus((status: BridgeComposerStatus) => {
+        setBridgeComposerStatus(status || null);
+      });
+      if (typeof maybeUnsub === 'function') unsubscribe = maybeUnsub;
+    }
+    window.electronAPI.invoke('api:getBridgeComposerStatus')
+      .then((status: BridgeComposerStatus) => setBridgeComposerStatus(status || null))
+      .catch((error) => console.warn('Failed to get initial bridge status', error));
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    bridgeComposerStatusRef.current = bridgeComposerStatus;
+  }, [bridgeComposerStatus]);
+
+  useEffect(() => {
     const init = async () => {
       await checkAuth();
       const savedId = localStorage.getItem('lastConvId');
-      if (savedId) { selectConversation(savedId, true, true); }
+      if (savedId) {
+        selectConversation(savedId, true, true);
+      } else {
+        window.electronAPI.invoke('api:prewarmConversation', { conversationId: null })
+          .catch((error) => console.warn('Failed to prewarm new chat bridge', error));
+      }
     };
     init();
     const handleGlobalPaste = (e: ClipboardEvent) => {
@@ -1158,6 +1291,8 @@ function App() {
   const activeMapMessageId = isMessageMapOpen ? viewportNavMessageId : targetMessageId;
   const trimmedSearchQuery = searchQuery.trim();
   const searchMatchCount = trimmedSearchQuery ? searchResults.length : 0;
+  const hasSendableInput = !!inputValue.trim() || !!pastedImage || attachedFiles.length > 0;
+  const isSendDisabled = isSending || !hasSendableInput || !isBridgeReadyForActiveConversation;
 
   return (
     <div className="app-container">
@@ -1169,7 +1304,7 @@ function App() {
       <div className="sidebar">
         <div className="sidebar-header">
           <div style={{ display: 'flex', gap: '8px' }}>
-            <button className="new-chat-btn" onClick={() => { saveVirtuosoState(activeConvIdRef.current); setActiveConvId(null); setMessages([]); activeConvIdRef.current = null; setRestoreVirtuosoState(null); }}>+ New Chat</button>
+            <button className="new-chat-btn" onClick={() => { saveVirtuosoState(activeConvIdRef.current); setActiveConvId(null); setMessages([]); activeConvIdRef.current = null; setRestoreVirtuosoState(null); window.electronAPI.invoke('api:prewarmConversation', { conversationId: null }).catch((error) => console.warn('Failed to prewarm new chat bridge', error)); }}>+ New Chat</button>
             <button className="search-trigger-btn" onClick={() => setShowSearch(true)} title="Search Chats">
               <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
             </button>
@@ -1282,6 +1417,11 @@ function App() {
                   <button className="send-error-dismiss" onClick={() => setSendError(null)} aria-label="Dismiss send error">×</button>
                 </div>
               )}
+              {bridgeActivityLabel && !sendError && (
+                <div className={`bridge-status-banner ${bridgeComposerStatus?.state === 'error' ? 'error' : ''}`}>
+                  <span>{bridgeActivityLabel}</span>
+                </div>
+              )}
               {pastedImage && <div className="image-preview"><img src={pastedImage} alt="Pasted" /><button className="remove-image" onClick={() => setPastedImage(null)}>×</button></div>}
               {attachedFiles.length > 0 && (
                 <div className="file-preview-list">
@@ -1312,7 +1452,7 @@ function App() {
                   {showModelMenu && <div className="model-picker-menu">{['Auto', 'Instant 5.3', 'Thinking 5.4 Standard', 'Thinking 5.4 Extended', 'Thinking 5.5 Standard', 'Thinking 5.5 Extended'].map(m => <button key={m} className={`model-picker-option ${selectedModel === m ? 'active' : ''}`} onClick={() => { setSelectedModel(m); setShowModelMenu(false); }}>{m}</button>)}</div>}
                 </div>
               <textarea ref={textareaRef} className="chat-input" placeholder="Send a message..." rows={1} value={inputValue} onChange={(e) => setInputValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }} />
-              <button className="send-btn" onClick={handleSend} disabled={isSending || (!inputValue.trim() && !pastedImage && attachedFiles.length === 0)}><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+              <button className={`send-btn ${isBridgeReadyForActiveConversation ? 'ready' : 'not-ready'}`} onClick={handleSend} disabled={isSendDisabled}><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
             </div>
           </div>
         </div>

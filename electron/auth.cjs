@@ -133,15 +133,37 @@ class ChatGPTAuth {
     return this.accessToken;
   }
 
+  async getDeviceId() {
+    try {
+      const cookies = await session.defaultSession.cookies.get({ domain: 'chatgpt.com', name: 'oai-did' });
+      if (cookies.length > 0) {
+        return cookies[0].value;
+      }
+    } catch (e) {
+      console.warn('Failed to get oai-did cookie:', e);
+    }
+    return null;
+  }
+
   async fetchWithAuth(url, options = {}) {
     const token = await this.getAccessToken();
     if (!token) throw new Error('Not authenticated');
 
+    const deviceId = await this.getDeviceId();
+
     const headers = {
       ...this.getBaseHeaders(),
-      ...options.headers,
       'Authorization': `Bearer ${token}`,
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+      'Priority': 'u=1, i',
+      ...options.headers,
     };
+
+    if (deviceId) {
+      headers['oai-device-id'] = deviceId;
+    }
 
     const hasContentType = Object.keys(headers).some(
       key => key.toLowerCase() === 'content-type'
