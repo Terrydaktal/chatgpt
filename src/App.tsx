@@ -201,6 +201,30 @@ const formatSendError = (error: unknown) => {
   return message;
 };
 
+const normalizeForSendVerification = (content: string) => content
+  .toLowerCase()
+  .replace(/\s+/g, ' ')
+  .replace(/[`*_~>#]/g, '')
+  .replace(/[()[\]{}]/g, '')
+  .trim();
+
+const matchesSentUserContent = (candidateContent: string, sentContent: string) => {
+  const candidate = normalizeForSendVerification(candidateContent);
+  const sent = normalizeForSendVerification(sentContent);
+  if (!sent) return true;
+  if (!candidate) return false;
+  if (candidate.includes(sent) || sent.includes(candidate)) return true;
+
+  // Large pasted/math-heavy messages may be normalized differently by upstream.
+  if (sent.length >= 64 && candidate.length >= 64) {
+    const start = sent.slice(0, 96);
+    const end = sent.slice(-96);
+    if (candidate.includes(start) && candidate.includes(end)) return true;
+  }
+
+  return false;
+};
+
 const summarizeMetadataOnlyStep = (msg: Message) => {
   if (!msg.metadata_json) return '';
   try {
@@ -843,12 +867,15 @@ function App() {
   const mapJumpLockUntilRef = useRef<number>(0);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const conversationsScrollerRef = useRef<HTMLElement | null>(null);
+  const mapListRef = useRef<HTMLDivElement | null>(null);
   const mapOpenRef = useRef(isMessageMapOpen);
   const viewportHighlightRafRef = useRef<number | null>(null);
   const updateViewportNavHighlightRef = useRef<() => void>(() => {});
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const pendingJumpRef = useRef<{ msgId: string; startedAt: number } | null>(null);
   const panelResizeRef = useRef<{ type: 'sidebar' | 'map'; startX: number; startWidth: number } | null>(null);
+  const suppressMiddlePasteRef = useRef(false);
+  const suppressMiddlePasteUntilRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const oomDebugEnabledRef = useRef<boolean>(localStorage.getItem('oomDebug') === '1');
   const oomDebugEntriesRef = useRef<OomDebugEntry[]>([]);
@@ -889,9 +916,9 @@ function App() {
     if (!status) return null;
     const sameConversation = (status.conversationId || null) === (activeConvId || null);
     if (!sameConversation) return null;
-    if (status.state === 'sending') return { state: status.state, text: 'Sending...' };
-    if (status.state === 'warming') return { state: status.state, text: 'Preparing chat...' };
+    if (status.state === 'sending') return { state: status.state, text: 'Thinking...' };
     if (status.state === 'thinking') return { state: status.state, text: status.reason?.trim() || 'Thinking...' };
+    // Intentionally exclude "warming" so "Preparing chat..." is not injected into the message list.
     return null;
   }, [activeConvId, bridgeComposerStatus]);
   const displayMessagesForView = useMemo(() => {
@@ -1022,6 +1049,10 @@ function App() {
     panelResizeRef.current = { type: 'map', startX: e.clientX, startWidth: mapPanelWidth };
     setActiveResizer('map');
   }, [mapPanelWidth]);
+  const markMiddlePasteSuppressed = useCallback(() => {
+    suppressMiddlePasteRef.current = true;
+    suppressMiddlePasteUntilRef.current = Date.now() + 1500;
+  }, []);
 
   const saveVirtuosoState = useCallback((conversationId: string | null) => {
     if (!conversationId || !virtuosoRef.current?.getState) return;
@@ -1146,6 +1177,7 @@ function App() {
       'Auto': 'auto', 'Instant 5.3': 'gpt-4o', 'Thinking 5.4 Standard': 'o1-mini',
       'Thinking 5.4 Extended': 'o1', 'Thinking 5.5 Standard': 'o3-mini', 'Thinking 5.5 Extended': 'o1',
     };
+    const baselineMessageIds = new Set(messages.map((m) => m.id));
     
     setSendError(null);
     setIsSending(true);
@@ -1219,9 +1251,17 @@ function App() {
         const textNeedle = outgoingContent.trim();
         const userMessageConfirmed = !textNeedle || latestMsgs.some((m: Message) => {
           if (m.role !== 'user') return false;
-          return (m.content || '').includes(textNeedle);
+          return matchesSentUserContent(m.content || '', textNeedle);
         });
-        if (!userMessageConfirmed) {
+        const hasNewUserTurn = latestMsgs.some((m: Message) => m.role === 'user' && !baselineMessageIds.has(m.id));
+        const hasNewAssistantTurn = latestMsgs.some((m: Message) =>
+          m.role === 'assistant' &&
+          !baselineMessageIds.has(m.id) &&
+          !!(m.content || '').trim()
+        );
+        const sendLikelySucceeded = userMessageConfirmed || hasNewUserTurn || hasNewAssistantTurn;
+
+        if (!sendLikelySucceeded) {
           setSendError('Send could not be verified in this chat. Your draft was kept so you can retry.');
           setInputValue(outgoingContent);
           setPastedImage(currentImage);
@@ -1523,6 +1563,15 @@ function App() {
   }, [isMessageMapOpen]);
 
   useEffect(() => {
+    const handleGlobalMiddleDown = (event: MouseEvent) => {
+      if (event.button !== 1) return;
+      markMiddlePasteSuppressed();
+    };
+    window.addEventListener('mousedown', handleGlobalMiddleDown, true);
+    return () => window.removeEventListener('mousedown', handleGlobalMiddleDown, true);
+  }, [markMiddlePasteSuppressed]);
+
+  useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
@@ -1756,6 +1805,30 @@ function App() {
     const timer = window.setTimeout(() => updateViewportNavHighlight(), 0);
     return () => window.clearTimeout(timer);
   }, [displayMessages, updateViewportNavHighlight, isMessageMapOpen]);
+
+  useEffect(() => {
+    if (!isMessageMapOpen) return;
+    const mapList = mapListRef.current;
+    const anchorId = viewportVisibleMessageIds[0];
+    if (!mapList || !anchorId) return;
+
+    const target = mapList.querySelector<HTMLElement>(`.content-nav-item[data-message-id="${anchorId}"]`);
+    if (!target) return;
+
+    const padding = 10;
+    const viewTop = mapList.scrollTop + padding;
+    const viewBottom = mapList.scrollTop + mapList.clientHeight - padding;
+    const itemTop = target.offsetTop;
+    const itemBottom = itemTop + target.offsetHeight;
+
+    if (itemTop < viewTop) {
+      mapList.scrollTop = Math.max(0, itemTop - padding);
+      return;
+    }
+    if (itemBottom > viewBottom) {
+      mapList.scrollTop = Math.max(0, itemBottom - mapList.clientHeight + padding);
+    }
+  }, [viewportVisibleMessageIds, isMessageMapOpen]);
 
   useEffect(() => {
     oomDebugStateRef.current = {
@@ -2041,10 +2114,11 @@ function App() {
             <div className="content-nav-header">
               <span>Message Map</span>
             </div>
-            <div className="content-nav-list" onMouseDown={(e) => startPanning(e, e.currentTarget as HTMLElement)}>
+            <div ref={mapListRef} className="content-nav-list" onMouseDown={(e) => startPanning(e, e.currentTarget as HTMLElement)}>
               {navigationMessages.map((msg) => (
                 <button
                   key={msg.id}
+                  data-message-id={msg.id}
                   className={`content-nav-item ${msg.role === 'user' ? 'role-user' : 'role-assistant'} ${activeMapMessageIds.has(msg.id) ? 'active' : ''} ${mapMatchMessageIds.has(msg.id) ? 'match' : ''}`}
                   onClick={() => jumpToMessageInCurrentChat(msg.id)}
                   title={msg.preview}
@@ -2141,26 +2215,49 @@ function App() {
                   </button>
                   {showModelMenu && <div className="model-picker-menu">{['Auto', 'Instant 5.3', 'Thinking 5.4 Standard', 'Thinking 5.4 Extended', 'Thinking 5.5 Standard', 'Thinking 5.5 Extended'].map(m => <button key={m} className={`model-picker-option ${selectedModel === m ? 'active' : ''}`} onClick={() => { setSelectedModel(m); setShowModelMenu(false); }}>{m}</button>)}</div>}
                 </div>
-	              <textarea
-	                ref={textareaRef}
-	                className="chat-input"
-	                placeholder="Send a message..."
-	                rows={1}
-	                value={inputValue}
-	                onChange={(e) => setInputValue(e.target.value)}
-	                onMouseDown={(e) => {
-	                  if (e.button === 1) e.preventDefault();
-	                }}
-	                onAuxClick={(e) => {
-	                  if (e.button === 1) e.preventDefault();
-	                }}
-	                onKeyDown={(e) => {
-	                  if (e.key === 'Enter' && !e.shiftKey) {
-	                    e.preventDefault();
-	                    handleSend();
-	                  }
-	                }}
-	              />
+		              <textarea
+		                ref={textareaRef}
+		                className="chat-input"
+		                placeholder="Send a message..."
+		                rows={1}
+		                value={inputValue}
+		                onChange={(e) => setInputValue(e.target.value)}
+		                onPointerDownCapture={(e) => {
+		                  if (e.button !== 1) return;
+		                  markMiddlePasteSuppressed();
+		                  e.preventDefault();
+		                }}
+		                onMouseDown={(e) => {
+		                  if (e.button !== 1) return;
+		                  markMiddlePasteSuppressed();
+		                  e.preventDefault();
+		                }}
+		                onMouseUp={(e) => {
+		                  if (e.button !== 1) return;
+		                  e.preventDefault();
+		                }}
+		                onAuxClick={(e) => {
+		                  if (e.button !== 1) return;
+		                  e.preventDefault();
+		                }}
+		                onPaste={(e) => {
+		                  const shouldSuppress = suppressMiddlePasteRef.current || Date.now() < suppressMiddlePasteUntilRef.current;
+		                  if (!shouldSuppress) return;
+		                  e.preventDefault();
+		                  suppressMiddlePasteRef.current = false;
+		                  suppressMiddlePasteUntilRef.current = 0;
+		                }}
+		                onKeyDown={(e) => {
+		                  if (e.key === 'Enter' && !e.shiftKey) {
+		                    e.preventDefault();
+		                    handleSend();
+		                  }
+		                }}
+		                onBlur={() => {
+		                  suppressMiddlePasteRef.current = false;
+		                  suppressMiddlePasteUntilRef.current = 0;
+		                }}
+		              />
 	              {bridgeActivityLabel && !sendError && (
 	                <span className={`bridge-status-inline ${bridgeComposerStatus?.state === 'error' ? 'error' : ''}`}>
 	                  {bridgeActivityLabel}

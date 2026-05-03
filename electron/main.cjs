@@ -681,6 +681,465 @@ async function waitForBridgeComposer(win, conversationId) {
   throw new Error(`Bridge did not find composer on ${expectedPath}. Path: ${lastState?.path}`);
 }
 
+function normalizeBridgeModelTarget(requestedModel) {
+  const raw = String(requestedModel || 'auto').trim().toLowerCase();
+  if (!raw || raw === 'auto' || raw === 'default') {
+    return { mode: 'auto', effort: null };
+  }
+
+  const map = {
+    'gpt-4o': { mode: 'instant', effort: null },
+    'gpt-5-3': { mode: 'instant', effort: null },
+    instant: { mode: 'instant', effort: null },
+    'o1-mini': { mode: 'thinking', effort: 'standard' },
+    'o3-mini': { mode: 'thinking', effort: 'standard' },
+    'o1': { mode: 'thinking', effort: 'extended' },
+    'gpt-5-5-thinking': { mode: 'thinking', effort: null },
+  };
+  if (map[raw]) return map[raw];
+
+  if (raw.includes('instant')) return { mode: 'instant', effort: null };
+  if (raw.includes('thinking')) {
+    if (raw.includes('extended')) return { mode: 'thinking', effort: 'extended' };
+    if (raw.includes('standard')) return { mode: 'thinking', effort: 'standard' };
+    return { mode: 'thinking', effort: null };
+  }
+
+  return { mode: 'auto', effort: null };
+}
+
+async function applyBridgeModelSelection(win, requestedModel) {
+  const target = normalizeBridgeModelTarget(requestedModel);
+  if (target.mode === 'auto') {
+    return { ok: true, skipped: 'auto' };
+  }
+
+  const result = await win.webContents.executeJavaScript(
+    `
+      (async () => {
+        const desiredModel = ${JSON.stringify(target.mode)};
+        const desiredEffort = ${JSON.stringify(target.effort)};
+        const norm = (v) => String(v || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const isVisible = (el) =>
+          !!el &&
+          !!el.isConnected &&
+          (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+        const click = (el) => {
+          if (!el) return false;
+          try { el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch {}
+          try { el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true })); } catch {}
+          try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
+          try { el.click(); } catch {}
+          try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch {}
+          return true;
+        };
+        const waitFor = async (fn, timeoutMs = 1800, intervalMs = 50) => {
+          const end = Date.now() + timeoutMs;
+          while (Date.now() < end) {
+            const value = fn();
+            if (value) return value;
+            await sleep(intervalMs);
+          }
+          return null;
+        };
+
+        const allMenus = () =>
+          Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible);
+        const menuItems = () =>
+          allMenus().flatMap((menu) =>
+            Array.from(menu.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')).filter(isVisible)
+          );
+
+        const getModelTrigger = () => {
+          const buttons = Array.from(document.querySelectorAll('button.__composer-pill, button[aria-haspopup="menu"]'));
+          return buttons.find((btn) => {
+            if (!isVisible(btn)) return false;
+            const cls = String(btn.className || '');
+            if (cls.includes('__composer-pill')) return true;
+            const text = norm(btn.textContent || '');
+            return text.includes('instant') || text.includes('thinking') || text.includes('extended') || text.includes('standard');
+          }) || null;
+        };
+
+        const openMenu = async () => {
+          if (allMenus().length > 0) return true;
+          const trigger = getModelTrigger();
+          if (!trigger) return false;
+          click(trigger);
+          const opened = await waitFor(() => allMenus()[0] || null);
+          return !!opened;
+        };
+
+        const closeMenu = () => {
+          try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); } catch {}
+        };
+
+        const pickModelInQuickMenu = async () => {
+          const items = menuItems();
+          if (items.length === 0) return false;
+          const candidate = items.find((el) => {
+            if (el.getAttribute('data-model-picker-thinking-effort-action') === 'true') return false;
+            const tid = norm(el.getAttribute('data-testid') || '');
+            const text = norm(el.textContent || '');
+            if (desiredModel === 'instant') {
+              return (
+                tid.includes('model-switcher-gpt-5-3') ||
+                tid.includes('model-switcher-instant') ||
+                text.startsWith('instant')
+              );
+            }
+            return (
+              tid.includes('model-switcher-gpt-5-5-thinking') ||
+              ((tid.includes('model-switcher') || text.includes('thinking')) && text.includes('thinking'))
+            );
+          }) || null;
+          if (!candidate) return false;
+          click(candidate);
+          await sleep(100);
+          return true;
+        };
+
+        const pickEffortInQuickMenu = async () => {
+          if (!desiredEffort) return true;
+          const actionBtn =
+            menuItems().find((el) => norm(el.getAttribute('data-testid') || '').includes('thinking-effort')) ||
+            document.querySelector('button[data-model-picker-thinking-effort-action="true"]');
+          if (!actionBtn || !isVisible(actionBtn)) return false;
+          click(actionBtn);
+          await sleep(100);
+
+          const effortItem = await waitFor(() => {
+            const target = menuItems().find((el) => {
+              const text = norm(el.textContent || '');
+              if (!text.includes(desiredEffort)) return false;
+              return text.includes('standard') || text.includes('extended');
+            });
+            return target || null;
+          }, 1500, 50);
+
+          if (!effortItem) return false;
+          click(effortItem);
+          await sleep(100);
+          return true;
+        };
+
+        const pickConfigureInQuickMenu = async () => {
+          const configure = menuItems().find((el) => {
+            const tid = norm(el.getAttribute('data-testid') || '');
+            const text = norm(el.textContent || '');
+            return tid.includes('model-configure-modal') || text.includes('configure');
+          });
+          if (!configure) return false;
+          click(configure);
+          const dialog = await waitFor(() => document.querySelector('div[role="dialog"][data-state="open"]'));
+          return !!dialog;
+        };
+
+        const pickModelInConfigureDialog = () => {
+          const dialog = document.querySelector('div[role="dialog"][data-state="open"]');
+          if (!dialog) return false;
+          const radioButtons = Array.from(dialog.querySelectorAll('button[role="radio"]')).filter(isVisible);
+          const target = radioButtons.find((el) => {
+            const text = norm(el.textContent || '');
+            return desiredModel === 'instant' ? text.includes('instant') : text.includes('thinking');
+          });
+          if (!target) return false;
+          if (target.getAttribute('aria-checked') !== 'true') {
+            click(target);
+          }
+          return true;
+        };
+
+        const pickEffortInConfigureDialog = async () => {
+          if (!desiredEffort) return true;
+          const dialog = document.querySelector('div[role="dialog"][data-state="open"]');
+          if (!dialog) return false;
+          const effortCombo = dialog.querySelector('button[aria-labelledby="thinking-effort-selection-label"]');
+          if (!effortCombo || !isVisible(effortCombo)) return false;
+          click(effortCombo);
+
+          const option = await waitFor(() => {
+            const menus = Array.from(document.querySelectorAll('[role="listbox"], [role="menu"]')).filter(isVisible);
+            for (const menu of menus) {
+              const nodes = Array.from(menu.querySelectorAll('[role="option"], [role="menuitemradio"], [role="menuitem"]')).filter(isVisible);
+              const match = nodes.find((el) => norm(el.textContent || '').includes(desiredEffort));
+              if (match) return match;
+            }
+            return null;
+          }, 2000, 50);
+          if (!option) return false;
+          click(option);
+          await sleep(100);
+          return true;
+        };
+
+        // First try quick menu path.
+        const openedQuick = await openMenu();
+        if (!openedQuick) return { ok: false, reason: 'Model menu trigger not found' };
+        const modelPicked = await pickModelInQuickMenu();
+        if (!modelPicked) return { ok: false, reason: 'Model entry not found in quick menu' };
+
+        // For thinking effort changes, try the quick effort action first, then fallback to Configure dialog.
+        if (desiredModel === 'thinking' && desiredEffort) {
+          if (allMenus().length === 0) {
+            await openMenu();
+          }
+          let effortPicked = await pickEffortInQuickMenu();
+          if (!effortPicked) {
+            if (allMenus().length === 0) {
+              await openMenu();
+            }
+            const openedDialog = await pickConfigureInQuickMenu();
+            if (!openedDialog) return { ok: false, reason: 'Configure dialog did not open for effort selection' };
+            const modelSetInDialog = pickModelInConfigureDialog();
+            const effortSetInDialog = await pickEffortInConfigureDialog();
+            if (!modelSetInDialog || !effortSetInDialog) {
+              return { ok: false, reason: 'Failed to set model/effort in configure dialog' };
+            }
+          }
+        }
+
+        closeMenu();
+        return { ok: true };
+      })();
+    `,
+    true
+  );
+
+  if (!result?.ok) {
+    return { ok: false, reason: String(result?.reason || 'Bridge model selection failed') };
+  }
+  return { ok: true };
+}
+
+function buildBridgeAttachmentPayload(image, files) {
+  const attachments = [];
+
+  if (typeof image === 'string' && image.startsWith('data:')) {
+    attachments.push({
+      name: 'image.png',
+      mimeType: 'image/png',
+      dataUrl: image,
+      sizeBytes: 0,
+    });
+  }
+
+  if (Array.isArray(files)) {
+    for (const file of files) {
+      if (!file || typeof file !== 'object') continue;
+      const dataUrl = typeof file.dataUrl === 'string' ? file.dataUrl : '';
+      if (!dataUrl.startsWith('data:')) continue;
+      attachments.push({
+        name: typeof file.name === 'string' && file.name.trim() ? file.name.trim() : 'attachment',
+        mimeType: typeof file.mimeType === 'string' && file.mimeType.trim() ? file.mimeType.trim() : 'application/octet-stream',
+        dataUrl,
+        sizeBytes: Number(file.sizeBytes) || 0,
+      });
+    }
+  }
+
+  return attachments;
+}
+
+async function applyBridgeAttachments(win, attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return { ok: true, count: 0 };
+  }
+
+  const result = await win.webContents.executeJavaScript(
+    `
+      (async () => {
+        const payload = ${JSON.stringify(attachments)};
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const isVisible = (el) =>
+          !!el &&
+          !!el.isConnected &&
+          (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+
+        const getComposer = () =>
+          document.querySelector('#prompt-textarea[contenteditable="true"]') ||
+          document.querySelector('div[contenteditable="true"][id="prompt-textarea"]') ||
+          document.querySelector('textarea#prompt-textarea');
+
+        const composer = getComposer();
+        if (!composer) return { ok: false, reason: 'Composer not found for file paste' };
+        if (typeof DataTransfer === 'undefined' || typeof File === 'undefined') {
+          return { ok: false, reason: 'DataTransfer/File API unavailable in bridge page' };
+        }
+
+        const existingRemovers = document.querySelectorAll('button[aria-label^="Remove file"]').length;
+        const dt = new DataTransfer();
+        let added = 0;
+
+        for (const item of payload) {
+          const dataUrl = String(item?.dataUrl || '');
+          if (!dataUrl.startsWith('data:')) continue;
+          const commaIndex = dataUrl.indexOf(',');
+          if (commaIndex <= 0) continue;
+          const meta = dataUrl.slice(0, commaIndex);
+          const base64 = dataUrl.slice(commaIndex + 1);
+          const mimeMatch = /^data:([^;]+)/i.exec(meta);
+          const mimeType = String(item?.mimeType || (mimeMatch ? mimeMatch[1] : 'application/octet-stream'));
+          const name = String(item?.name || (mimeType.startsWith('image/') ? 'image.png' : 'attachment'));
+
+          let bytes;
+          try {
+            const bin = atob(base64);
+            bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          } catch {
+            continue;
+          }
+
+          const blob = new Blob([bytes], { type: mimeType || 'application/octet-stream' });
+          const file = new File([blob], name, { type: mimeType || 'application/octet-stream' });
+          dt.items.add(file);
+          added += 1;
+        }
+
+        if (added === 0) {
+          return { ok: false, reason: 'No valid attachment payloads to paste' };
+        }
+
+        try { composer.focus(); } catch {}
+
+        let pasteEvent;
+        try {
+          pasteEvent = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        } catch {
+          pasteEvent = new Event('paste', { bubbles: true, cancelable: true });
+          try {
+            Object.defineProperty(pasteEvent, 'clipboardData', {
+              value: dt,
+              writable: false,
+              configurable: true,
+            });
+          } catch {}
+        }
+
+        // ProseMirror handlers often call preventDefault() on paste, which makes
+        // dispatchEvent return false even when paste is successfully handled.
+        composer.dispatchEvent(pasteEvent);
+
+        const deadline = Date.now() + 12000;
+        const expected = existingRemovers + added;
+        while (Date.now() < deadline) {
+          const removeButtons = document.querySelectorAll('button[aria-label^="Remove file"]').length;
+          if (removeButtons >= expected) {
+            return { ok: true, count: added };
+          }
+          await sleep(100);
+        }
+
+        // Fallback: if file chips are present even without remove-label buttons, treat as success.
+        const chips = Array.from(document.querySelectorAll('[role="group"][aria-label], img[src*="/backend-api/estuary/content"]')).filter(isVisible);
+        if (chips.length > 0) {
+          return { ok: true, count: added, fallback: 'chip-detected' };
+        }
+        return { ok: false, reason: 'Attachment tiles did not appear after paste' };
+      })();
+    `,
+    true
+  );
+
+  if (!result?.ok) {
+    return { ok: false, reason: String(result?.reason || 'Bridge attachment paste failed') };
+  }
+  return { ok: true, count: Number(result?.count) || 0 };
+}
+
+async function setBridgeComposerText(win, prompt) {
+  const text = String(prompt || '');
+  const result = await win.webContents.executeJavaScript(
+    `
+      (() => {
+        const prompt = ${JSON.stringify(text)};
+        const getComposer = () =>
+          document.querySelector('#prompt-textarea[contenteditable="true"]') ||
+          document.querySelector('div[contenteditable="true"][id="prompt-textarea"]') ||
+          document.querySelector('textarea#prompt-textarea') ||
+          document.querySelector('textarea[placeholder*="ask" i], textarea[placeholder*="message" i]');
+        const composer = getComposer();
+        if (!composer) return { ok: false, reason: 'Composer not found while setting text' };
+
+        composer.focus();
+        const tag = (composer.tagName || '').toUpperCase();
+        if (tag === 'TEXTAREA') {
+          composer.value = prompt;
+          composer.dispatchEvent(new Event('input', { bubbles: true }));
+          return { ok: true };
+        }
+
+        // Contenteditable (ProseMirror) path
+        composer.textContent = '';
+        if (prompt) {
+          const lines = prompt.split(/\\r?\\n/);
+          const fragment = document.createDocumentFragment();
+          for (let i = 0; i < lines.length; i++) {
+            const p = document.createElement('p');
+            const line = lines[i];
+            if (line.length === 0) {
+              p.appendChild(document.createElement('br'));
+            } else {
+              p.textContent = line;
+            }
+            fragment.appendChild(p);
+          }
+          composer.appendChild(fragment);
+        } else {
+          const p = document.createElement('p');
+          p.appendChild(document.createElement('br'));
+          composer.appendChild(p);
+        }
+
+        const range = document.createRange();
+        range.selectNodeContents(composer);
+        range.collapse(false);
+        const sel = window.getSelection();
+        if (sel) {
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+        composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+        return { ok: true };
+      })();
+    `,
+    true
+  );
+
+  if (!result?.ok) {
+    return { ok: false, reason: String(result?.reason || 'Failed to set composer text') };
+  }
+  return { ok: true };
+}
+
+async function waitForBridgeSendReady(win) {
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    const snapshot = await win.webContents.executeJavaScript(
+      `
+        (() => {
+          const sendBtn =
+            document.querySelector('#composer-submit-button') ||
+            document.querySelector('button[data-testid="send-button"]') ||
+            document.querySelector('button[aria-label="Send prompt"]') ||
+            document.querySelector('button[aria-label*="Send"]');
+          const hasUploadingIndicator =
+            document.querySelectorAll('[role="progressbar"], [aria-busy="true"], [data-testid*="upload"], [data-testid*="loading"]').length > 0;
+          if (!sendBtn) return { ready: false, reason: 'send_not_found' };
+          const disabled = !!sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true';
+          return { ready: !disabled && !hasUploadingIndicator, disabled, hasUploadingIndicator };
+        })();
+      `,
+      true
+    );
+    if (snapshot?.ready) return { ok: true };
+    await sleep(120);
+  }
+  return { ok: false, reason: 'Send button stayed disabled/busy after attachments/text update' };
+}
+
 async function prewarmBridgeConversation(conversationId) {
   const normalizedConversationId = conversationId || null;
   const warmToken = ++bridgeWarmRequestToken;
@@ -823,7 +1282,7 @@ async function monitorBridgeGeneration(conversationId) {
   }
 }
 
-async function sendConversationViaUiAutomation({ conversationId, content }) {
+async function sendConversationViaUiAutomation({ conversationId, content, model, image, files }) {
   const targetUrl = conversationId
     ? `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`
     : 'https://chatgpt.com/';
@@ -837,6 +1296,19 @@ async function sendConversationViaUiAutomation({ conversationId, content }) {
   win.webContents.focus();
   
   await waitForBridgeComposer(win, conversationId || null);
+
+  const modelSelection = await applyBridgeModelSelection(win, model);
+  if (!modelSelection?.ok) {
+    return { ok: false, status: 0, statusText: 'ui_model_select_failed', bodyText: String(modelSelection?.reason || 'Model selection failed') };
+  }
+
+  const attachments = buildBridgeAttachmentPayload(image, files);
+  if (attachments.length > 0) {
+    const attachResult = await applyBridgeAttachments(win, attachments);
+    if (!attachResult?.ok) {
+      return { ok: false, status: 0, statusText: 'ui_attach_failed', bodyText: String(attachResult?.reason || 'Attachment upload failed') };
+    }
+  }
   
   const setup = await win.webContents.executeJavaScript(
     `
@@ -878,9 +1350,17 @@ async function sendConversationViaUiAutomation({ conversationId, content }) {
     return { ok: false, status: 0, statusText: 'ui_send_failed', bodyText: String(setup?.reason || 'Composer setup failed') };
   }
 
-  // Insert the text and click send
-  await win.webContents.insertText(prompt);
-  await sleep(100);
+  // Insert text explicitly into the composer (more reliable than insertText for contenteditable editors).
+  const textResult = await setBridgeComposerText(win, prompt);
+  if (!textResult?.ok) {
+    return { ok: false, status: 0, statusText: 'ui_text_set_failed', bodyText: String(textResult?.reason || 'Failed to set prompt text') };
+  }
+
+  const sendReady = await waitForBridgeSendReady(win);
+  if (!sendReady?.ok) {
+    return { ok: false, status: 0, statusText: 'ui_send_not_ready', bodyText: String(sendReady?.reason || 'Send control not ready') };
+  }
+  await sleep(80);
 
   const clickResult = await win.webContents.executeJavaScript(
     `
@@ -1538,15 +2018,12 @@ function setupIpc() {
     }
   });
 
-  ipcMain.handle('api:sendMessage', async (event, { conversationId, content, image, files }) => {
+  ipcMain.handle('api:sendMessage', async (event, { conversationId, content, model, image, files }) => {
     try {
       const fileList = Array.isArray(files) ? files : [];
-      if (image || fileList.length > 0) {
-        throw new Error('Bridge-only send currently supports text prompts only.');
-      }
 
       const prompt = String(content || '');
-      if (!prompt.trim()) {
+      if (!prompt.trim() && !image && fileList.length === 0) {
         throw new Error('Cannot send an empty message.');
       }
 
@@ -1565,6 +2042,9 @@ function setupIpc() {
       const uiResult = await sendConversationViaUiAutomation({
         conversationId: conversationId || null,
         content: prompt,
+        model,
+        image,
+        files: fileList,
       });
 
       if (!uiResult?.ok) {
